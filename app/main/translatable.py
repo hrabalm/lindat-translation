@@ -5,9 +5,9 @@ class Translatable:
         self._output_word_count = None
         self._input_nfc_len = None
 
-    def translate_from_to(self, src, tgt):
+    def translate_from_to(self, src, tgt, custom_prompt=None, split=True):
         raise NotImplementedError()
-    def translate_with_model(self, model, src, tgt):
+    def translate_with_model(self, model, src, tgt, custom_prompt=None, split=True):
         raise NotImplementedError()
     def get_text(self):
         raise NotImplementedError()

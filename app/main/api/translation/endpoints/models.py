@@ -104,6 +104,8 @@ class ModelItem(MyAbstractResource):
     @ns.response(code=415, description="Unsupported file type for translation")
     @ns.param(**{'name': 'tgt', 'description': 'tgt query param description', 'x-example': 'cs'})
     @ns.param(**{'name': 'src', 'description': 'src query param description', 'x-example': 'en'})
+    @ns.param(**{'name': 'prompt', 'description': 'custom prompt for an LLM', 'x-example': 'Translate this text into Czech: '})
+
     @ns.param(**{'name': 'input_text', 'description': 'text to translate',
                  'x-example': 'this is a sample text', '_in': 'formData'})
     def post(self, model):
@@ -119,6 +121,9 @@ class ModelItem(MyAbstractResource):
         model = models.get_model(model)
         src_default = list(model.supports.keys())[0]
         src = args.get('src', src_default) or src_default
+        prompt = args.get('prompt', None)
+        split = args.get('split-newlines', None)
+
         if src not in model.supports.keys():
             ns.abort(code=404,
                       message='This model does not support translation from {}'
@@ -131,7 +136,7 @@ class ModelItem(MyAbstractResource):
                       .format(src, tgt))
         self.set_media_type_representations()
         try:
-            translatable.translate_with_model(model, src, tgt)
+            translatable.translate_with_model(model, src, tgt, custom_prompt=prompt, split=split)
             extra_msg = 'src={};tgt={};model={}'.format(src, tgt, model.name)
             return translatable.create_response(self.extra_headers(extra_msg))
         finally:

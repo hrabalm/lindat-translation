@@ -24,6 +24,8 @@ class Model(object):
                 return models.T2TDocModel(cfg)
             elif cfg['model_framework'] == 'tensorflow_with_scores':
                 return models.T2TModelWithScores(cfg)
+            elif cfg['model_framework'] == 'oai_llm':
+                return models.OaiLLMModel(cfg)
         return models.T2TModel(cfg)
 
     @staticmethod
@@ -34,7 +36,7 @@ class Model(object):
         self.model = cfg['model']
         self.name = self.model
         self.target_to_source = cfg.get('target_to_source', False)
-
+        self.ignore_tags = cfg.get('ignore_tags', False)
         self.supports = {}
         for src_lang in cfg['source']:
             for tgt_lang in cfg['target']:
@@ -114,15 +116,15 @@ class Model(object):
         if self.href:
             yield 'href', self.href
 
-    def translate(self, text, src=None, tgt=None):
+    def translate(self, text, src=None, tgt=None, custom_prompt=None, split=True):
         src = src or list(self.supports.keys())[0]
         tgt = tgt or self.supports[src][0]
 
-        blocks_of_text, formatting = self.extract_blocks_of_text(text, src)
-        outputs = self.send_blocks_to_backend(blocks_of_text, src, tgt)
+        blocks_of_text, formatting = self.extract_blocks_of_text(text, src, split=split)
+        outputs = self.send_blocks_to_backend(blocks_of_text, src, tgt, custom_prompt=custom_prompt)
         return self.reconstruct_formatting(outputs, formatting)
 
-    def extract_blocks_of_text(self, text, text_lang):
+    def extract_blocks_of_text(self, text, text_lang, split=True):
         """
         Default block of text is a sentence
         :param text:
@@ -130,9 +132,8 @@ class Model(object):
         :return:
         """
         log.debug("Model::extract_blocks_of_text")
-        return self.extract_sentences(text, text_lang)
-
-    def send_blocks_to_backend(self, blocks, src, tgt):
+        return self.extract_sentences(text, text_lang,split=split)
+    def send_blocks_to_backend(self, blocks, src, tgt, custom_prompt=None):
         """
         By default calls send_sentences_to_backend
         :param blocks:
@@ -141,20 +142,23 @@ class Model(object):
         :return:
         """
         log.debug("Model::send_blocks_to_backend")
-        return self.send_sentences_to_backend(blocks, src, tgt)
+        return self.send_sentences_to_backend(blocks, src, tgt, custom_prompt=custom_prompt)
 
-    def send_sentences_to_backend(self, sentences, src, tgt):
+    def send_sentences_to_backend(self, sentences, src, tgt, custom_prompt=None):
         raise NotImplementedError("Abstract method")
 
-    def extract_sentences(self, text, text_lang):
+    def extract_sentences(self, text, text_lang, split=True):
         sentences = []
         newlines_after = []
-        for segment in text.split('\n'):
-            if segment:
-                sentences += self.split_to_sent_array(segment, lang=text_lang,
+        if split:
+            for segment in text.split('\n'):
+                if segment:
+                    sentences += self.split_to_sent_array(segment, lang=text_lang,
                                                       )
-            newlines_after.append(len(sentences) - 1)
-        return sentences, newlines_after
+                newlines_after.append(len(sentences) - 1)
+            return sentences, newlines_after
+        else:
+            return [text], [0]
 
     def split_to_sent_array(self, segment, lang):
         raise NotImplementedError("Abstract method")
