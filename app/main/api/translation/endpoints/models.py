@@ -8,6 +8,7 @@ from app.model_settings import models
 
 from app.main.api_examples.model_resource_example import *
 from app.main.api_examples.models_resource_example import *
+import json
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
@@ -105,6 +106,7 @@ class ModelItem(MyAbstractResource):
     @ns.param(**{'name': 'tgt', 'description': 'tgt query param description', 'x-example': 'cs'})
     @ns.param(**{'name': 'src', 'description': 'src query param description', 'x-example': 'en'})
     @ns.param(**{'name': 'prompt', 'description': 'custom prompt for an LLM', 'x-example': 'Translate this text into Czech: '})
+    @ns.param(**{'name': 'terms', 'description': 'terms', 'x-example': '[[(term1, term1translation)]]'})
 
     @ns.param(**{'name': 'input_text', 'description': 'text to translate',
                  'x-example': 'this is a sample text', '_in': 'formData'})
@@ -123,7 +125,9 @@ class ModelItem(MyAbstractResource):
         src = args.get('src', src_default) or src_default
         prompt = args.get('prompt', None)
         split = args.get('split-newlines', None)
-
+        terms= args.get('terms', None)
+        log.error('terms: {}'.format(terms))
+        terms = json.loads(terms) if terms else None
         if src not in model.supports.keys():
             ns.abort(code=404,
                       message='This model does not support translation from {}'
@@ -136,7 +140,7 @@ class ModelItem(MyAbstractResource):
                       .format(src, tgt))
         self.set_media_type_representations()
         try:
-            translatable.translate_with_model(model, src, tgt, custom_prompt=prompt, split=split)
+            translatable.translate_with_model(model, src, tgt, custom_prompt=prompt, split=split, terms=terms)
             extra_msg = 'src={};tgt={};model={}'.format(src, tgt, model.name)
             return translatable.create_response(self.extra_headers(extra_msg))
         finally:

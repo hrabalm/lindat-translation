@@ -116,12 +116,12 @@ class Model(object):
         if self.href:
             yield 'href', self.href
 
-    def translate(self, text, src=None, tgt=None, custom_prompt=None, split=True):
+    def translate(self, text, src=None, tgt=None, custom_prompt=None, terms=None, split=True):
         src = src or list(self.supports.keys())[0]
         tgt = tgt or self.supports[src][0]
 
         blocks_of_text, formatting = self.extract_blocks_of_text(text, src, split=split)
-        outputs = self.send_blocks_to_backend(blocks_of_text, src, tgt, custom_prompt=custom_prompt)
+        outputs = self.send_blocks_to_backend(blocks_of_text, src, tgt, custom_prompt=custom_prompt, terms=terms)
         return self.reconstruct_formatting(outputs, formatting)
 
     def extract_blocks_of_text(self, text, text_lang, split=True):
@@ -133,7 +133,7 @@ class Model(object):
         """
         log.debug("Model::extract_blocks_of_text")
         return self.extract_sentences(text, text_lang,split=split)
-    def send_blocks_to_backend(self, blocks, src, tgt, custom_prompt=None):
+    def send_blocks_to_backend(self, blocks, src, tgt, custom_prompt=None, terms=None):
         """
         By default calls send_sentences_to_backend
         :param blocks:
@@ -142,9 +142,9 @@ class Model(object):
         :return:
         """
         log.debug("Model::send_blocks_to_backend")
-        return self.send_sentences_to_backend(blocks, src, tgt, custom_prompt=custom_prompt)
+        return self.send_sentences_to_backend(blocks, src, tgt, custom_prompt=custom_prompt, terms=terms)
 
-    def send_sentences_to_backend(self, sentences, src, tgt, custom_prompt=None):
+    def send_sentences_to_backend(self, sentences, src, tgt, custom_prompt=None, terms=None):
         raise NotImplementedError("Abstract method")
 
     def extract_sentences(self, text, text_lang, split=True):
