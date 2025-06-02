@@ -6,18 +6,18 @@ import logging
 log = logging.getLogger(__name__)
 
 
-def translate_with_model(model, text, src=None, tgt=None, return_source_sentences=False, custom_prompt=None, split=True):
+def translate_with_model(model, text, src=None, tgt=None, return_source_sentences=False, custom_prompt=None, split=True, replace_newlines=False):
     if not text or not text.strip():
         return []
     if return_source_sentences:
         src_sents = model.reconstruct_formatting(*model.extract_sentences(text, src, split=split))
-        tgt_sents = model.translate(text, src, tgt, custom_prompt=custom_prompt, split=split)
+        tgt_sents = model.translate(text, src, tgt, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
         return src_sents, tgt_sents
     else:
         return model.translate(text, src, tgt, custom_prompt=custom_prompt, split=split)
 
 
-def translate_from_to(source, target, text, return_source_sentences=False, custom_prompt=None, split=True):
+def translate_from_to(source, target, text, return_source_sentences=False, custom_prompt=None, split=True, replace_newlines=False):
     models_on_path = models.get_model_list(source, target)
     if not models_on_path:
         raise ValueError('No models found for the given pair')
@@ -28,7 +28,7 @@ def translate_from_to(source, target, text, return_source_sentences=False, custo
 
     translation = []
     for obj in models_on_path:
-        translation = translate_with_model(obj['model'], text, obj['src'], obj['tgt'], custom_prompt=custom_prompt, split=split)
+        translation = translate_with_model(obj['model'], text, obj['src'], obj['tgt'], custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
         text = _extract_text(translation)
     
     if return_source_sentences:

@@ -32,4 +32,4 @@ UPLOAD_FOLDER = '/tmp/translator_uploads'
 # These should match with the appropriate constants in the frontend
 ALLOWED_EXTENSIONS = {'inxml', 'txt', 'xml', 'html', 'htm', 'docx', 'odt', 'pptx', 'odp', 'xlsx', 'ods', 'pdf', 'srt', 'md', 'xlf', 'json', 'yaml'}
 
-TIKAL_PATH='/lnet/work/people/jon/okapi-apps/'
+TIKAL_PATH='/home/jon/okapi-apps/'
