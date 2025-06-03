@@ -23,7 +23,7 @@ from document_translation.regextokenizer import RegexTokenizer
 from document_translation.pdf_tools.pdfeditor import PdfEditor
 
 import xml.etree.ElementTree as ET
-from html import unescape
+from html import unescape, escape
 
 class InnerLindatTranslator(Translator):
     def __init__(self, method, src, tgt, model=None, custom_prompt=None, split=True, replace_newlines=True):
@@ -138,30 +138,40 @@ class Document(Translatable):
                     line = fun(line)
                     f_out.write(line)
 
-        import re
-        import html
+        # import re
+        # import html
+        # import base64
+        
+        # def b64encode(text):
+        #     """Encode text to base64."""
+        #     return base64.b64encode(text.encode('utf-8')).decode('utf-8')
 
-        def custom_unescape(text):
-            escaped_tag_pattern = r'(&lt;(?P<content>.+?)&gt;)'
-            return re.sub(escaped_tag_pattern, lambda m: f"<DOUBLE content=\"{html.escape(m.group('content'))}\"/>", text)
+        # def b64decode(text):
+        #     """Decode base64 text."""
+        #     return base64.b64decode(text.encode('utf-8')).decode('utf-8')
 
-        def custom_escape(text):
-            def replace_double_tag(match):
-                content = match.group('content')
-                return f"&lt;{html.unescape(content)}&gt;"
+        # def custom_unescape(text):
+        #     escaped_tag_pattern = r'(&lt;(?P<content>.+?)&gt;)'
+        #     return re.sub(escaped_tag_pattern, lambda m: f"<DOUBLE content=\"{b64encode(m.group('content'))}\"/>", text)
 
-            return re.sub(r'<DOUBLE content="(?P<content>.+?)"/>', replace_double_tag, text)
+        # def custom_escape(text):
+        #     def replace_double_tag(match):
+        #         content = match.group('content')
+        #         return f"&lt;{b64decode(content)}&gt;"
 
-        def fraus_double_unescape(text):
-            """We try to unescape while keeping track of tags which were escaped twice."""
-            first_pass = html.unescape(text)
-            second_pass = custom_unescape(first_pass)
-            third_pass = html.unescape(second_pass)
-            return third_pass
+        #     return re.sub(r'<DOUBLE content="(?P<content>.+?)"/>', replace_double_tag, text)
 
-        def fraus_reescape(text):
-            first_pass = custom_escape(text)
-            return first_pass
+        # def fraus_double_unescape(text):
+        #     """We try to unescape while keeping track of tags which were escaped twice."""
+        #     first_pass = html.unescape(text)
+        #     second_pass = custom_unescape(first_pass)
+        #     third_pass = html.unescape(second_pass)
+        #     return third_pass
+
+        # def fraus_reescape(text):
+        #     first_pass = custom_escape(text)
+        #     second_pass = html.escape(first_pass)
+        #     return second_pass
 
         # fix the wrong encoding in the FRAUS XML
         xml_path = self.orig_full_path+".fixed"
@@ -183,7 +193,14 @@ class Document(Translatable):
         # transform_lines(tikal_output, tikal_output+".html.1st", unescape)
         # transform_lines(tikal_output+".html.1st", tikal_output+".html", unescape)
 
-        transform_lines(tikal_output, tikal_output+".html", fraus_double_unescape)
+        def _double_unescape_and_nbsp(text):
+            # also handles the &nbsp
+
+            # note that \xa0 is handled by ufal/document-translation, so we
+            # don't have to handle it here 
+            return unescape(unescape(text)).replace("&nbsp;", " ")
+
+        transform_lines(tikal_output, tikal_output+".html", _double_unescape_and_nbsp)
 
         # wrap each line in <p> tags to make them separate paragraphs
         def _wrap_in_p_tags(line):
@@ -219,12 +236,11 @@ class Document(Translatable):
         def _unwrap_p_tags(line):
             stripped_line = line.rstrip('\n')
             return stripped_line[3:-4] + "\n"
+        
+        def _unwrap_p_tags_and_escape(line):
+            return escape(escape(_unwrap_p_tags(line)))
 
-        def _unescape_and_unwrap_p_tags(line):
-            unescaped_line = fraus_reescape(line)
-            return _unwrap_p_tags(unescaped_line)
-
-        transform_lines(translated_html, xml_path + ".translated", _unescape_and_unwrap_p_tags)
+        transform_lines(translated_html, xml_path + ".translated", _unwrap_p_tags_and_escape)
 
         # reinsert translation into FRAUS XML using Tikal
         self.translated_path = self.get_translated_path(tgt)
