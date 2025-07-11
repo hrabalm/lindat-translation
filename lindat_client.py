@@ -4,7 +4,7 @@ import argparse
 import requests
 import uuid
 import html
-def translate_text(src_lang, tgt_lang, text, model, tags, terms, prompt, base_url):
+def translate_text(src_lang, tgt_lang, text, model, tags, prompt, base_url):
     """
     Translate text using the specified translation API.
 
@@ -26,7 +26,7 @@ def translate_text(src_lang, tgt_lang, text, model, tags, terms, prompt, base_ur
         #text=text.replace('\n','<newLineTag/>')
         files = {
             'input_text': (
-                f'line{uuid.uuid4().hex}.inxml',
+                f'line{uuid.uuid4().hex}.innopxml',
                 f"<mytestdoc>{text}</mytestdoc>",
                 'text/xml'
             )
@@ -34,26 +34,30 @@ def translate_text(src_lang, tgt_lang, text, model, tags, terms, prompt, base_ur
         data = {"src": src_lang, "tgt": tgt_lang}
         if prompt:
             data["prompt"] = prompt
-        if terms:
-            data["terms"]="["+terms+"]"
-
         response = requests.post(url, files=files, data=data)
-    else:
-        data = {"input_text": text, "src": src_lang, "tgt": tgt_lang}
-        if prompt:
-            data["prompt"] = prompt
-        if terms:
-            data["terms"]="["+terms+"]"
-        print(data)
-        response = requests.post(url, data=data)
-
-    response.encoding = "utf-8"
-    if response.status_code == 200:
+        if response.status_code == 200:
         # Remove XML wrapper if it was added
-        return response.text.strip().replace("<mytestdoc>", "").replace("</mytestdoc>", "")#.replace("<newLineTag/>","\n")
-    else:
-        return f"Error: {response.status_code} - {response.text}"
+            return response.text.strip().replace("<mytestdoc>", "").replace("</mytestdoc>", "")#.replace("<newLineTag/>","\n")
+        else:
+            return f"Error: {response.status_code} - {response.text}"
 
+    else:
+        paragraphs=text.split('<p>')
+        full_response=[]
+        for i,p in enumerate(paragraphs):
+            if p=='': continue
+            if i>0: p='<p>'+p
+            data = {"input_text": p, "src": src_lang, "tgt": tgt_lang}
+            if prompt:
+                data["prompt"] = prompt
+            response = requests.post(url, data=data)
+
+            response.encoding = "utf-8"
+            if response.status_code == 200:
+                full_response.append(response.text.strip())
+            else:
+                return f"Error: {response.status_code} - {response.text}"
+        return "".join(full_response)
 def main():
     parser = argparse.ArgumentParser(
         description="Translate a block of text using a translation API."
@@ -68,9 +72,6 @@ def main():
                         help="Wrap the input text with XML tags.")
     parser.add_argument("--prompt", default=None,
                         help="Optional prompt for translation.")
-    parser.add_argument("--terms", default=None,
-                        help="Optional terms for translation.")
-
     parser.add_argument("--base-url", default="http://localhost:5001/api/v2/models",
                         help="Base URL for the translation API (default: http://localhost:5001/api/v2/models)")
     parser.add_argument("input_file", nargs="?", type=argparse.FileType("r"),
@@ -89,7 +90,6 @@ def main():
             text=text,
             model=args.model,
             tags=args.tags,
-            terms=args.terms,
             prompt=args.prompt,
             base_url=args.base_url
         )
