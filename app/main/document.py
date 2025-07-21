@@ -26,15 +26,15 @@ import xml.etree.ElementTree as ET
 from html import unescape, escape
 
 class InnerLindatTranslator(Translator):
-    def __init__(self, method, src, tgt, model=None, custom_prompt=None, split=True, replace_newlines=True):
+    def __init__(self, method, src, tgt, model=None, custom_prompt=None, terms=None, split=True):
         self.method = method
         self.src = src
         self.tgt = tgt
         self.model = model
         self.split = split
         self.custom_prompt = custom_prompt
-        self.replace_newlines=replace_newlines
-    def translate(self, input_text: str, split=True, replace_newlines=True) -> Tuple[List[str], List[str]]:
+
+    def translate(self, input_text: str, split=True) -> Tuple[List[str], List[str]]:
         # translator does not like leading newlines, so we remove them and add them back later
         num_prefix_newlines = 0
         if input_text.startswith("\n"):
@@ -49,9 +49,9 @@ class InnerLindatTranslator(Translator):
 
         # here we translate the text
         if self.method == "with_model":
-            src_sentences, tgt_sentences = translate_with_model(self.model, input_text, self.src, self.tgt, return_source_sentences=True, custom_prompt=self.custom_prompt, split=split, replace_newlines=replace_newlines)
+            src_sentences, tgt_sentences = translate_with_model(self.model, input_text, self.src, self.tgt, return_source_sentences=True, custom_prompt=self.custom_prompt, split=split)
         else:
-            src_sentences, tgt_sentences = translate_from_to(self.src, self.tgt, input_text, return_source_sentences=True, custom_prompt=self.custom_prompt, split=split, replace_newlines=replace_newlines)
+            src_sentences, tgt_sentences = translate_from_to(self.src, self.tgt, input_text, return_source_sentences=True, custom_prompt=self.custom_prompt, split=split)
 
         # post process the translation
         if tgt_sentences:
@@ -82,12 +82,12 @@ class Document(Translatable):
         self._input_word_count = 0
         self._output_word_count = 0
         self._input_nfc_len = 0
-    
+
     @classmethod
     def from_file(cls, request_file):
         if not request_file:
             api.abort(code=400, message='Empty file')
-        
+
         if not cls.allowed_file(request_file.filename):
             api.abort(code=415, message='Unsupported file type for translation')
 
@@ -104,27 +104,27 @@ class Document(Translatable):
         extension_check = '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
         return extension_check
 
-    def translate_from_to(self, src, tgt, custom_prompt=None, split=True, replace_newlines=True):
-        self._extract_translate_merge(src, tgt, "from_to", None, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
+    def translate_from_to(self, src, tgt, custom_prompt=None, terms=None, split=True):
+        self._extract_translate_merge(src, tgt, "from_to", None, custom_prompt=custom_prompt, terms=terms, split=split)
 
-    def translate_with_model(self, model, src, tgt, custom_prompt=None, split=True, replace_newlines=True):
-        self._extract_translate_merge(src, tgt, "with_model", model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
-    
-    def _extract_translate_merge(self, src, tgt, method, model, custom_prompt=None, split=True, replace_newlines=True):
+    def translate_with_model(self, model, src, tgt, custom_prompt=None, terms=None, split=True):
+        self._extract_translate_merge(src, tgt, "with_model", model, custom_prompt=custom_prompt, terms=terms, split=split)
+
+    def _extract_translate_merge(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
         if self.orig_full_path.endswith('.pdf'):
-            self._extract_translate_merge_pdf(src, tgt, method, model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
+            self._extract_translate_merge_pdf(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
         else:
             args = text_input_with_src_tgt.parse_args(request)
             if args.get('fraus', False):
-                self._extract_translate_merge_fraus(src, tgt, method, model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
+                self._extract_translate_merge_fraus(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
             else:
-                self._extract_translate_merge_document(src, tgt, method, model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
-    
+                self._extract_translate_merge_document(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
+
     def get_translated_path(self, tgt):
         orig_root, file_extension = os.path.splitext(self.orig_full_path)
         return f"{orig_root}.{tgt}{file_extension}"
 
-    def _extract_translate_merge_fraus(self, src, tgt, method, model, custom_prompt=None, split=True, replace_newlines=True):
+    def _extract_translate_merge_fraus(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
         def fix_fraus_encoding(input_file, output_file):
             with open(input_file, 'r', encoding='utf-8') as f_in, open(output_file, 'w', encoding='utf-8') as f_out:
                 for line in f_in:
@@ -141,7 +141,7 @@ class Document(Translatable):
         # import re
         # import html
         # import base64
-        
+
         # def b64encode(text):
         #     """Encode text to base64."""
         #     return base64.b64encode(text.encode('utf-8')).decode('utf-8')
@@ -197,7 +197,7 @@ class Document(Translatable):
             # also handles the &nbsp
 
             # note that \xa0 is handled by ufal/document-translation, so we
-            # don't have to handle it here 
+            # don't have to handle it here
             return unescape(unescape(text)).replace("&nbsp;", " ")
 
         transform_lines(tikal_output, tikal_output+".html", _double_unescape_and_nbsp)
@@ -219,13 +219,13 @@ class Document(Translatable):
         self.text = open(tikal_output_2nd).read()
 
         # translate the text
-        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
-    
+        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
+
         # write translation to file
         translated_text_path = tikal_output + f".html.p.{tgt}"
         with open(translated_text_path, 'w') as f:
             f.write(self.translation)
-        
+
         # reinsert translation into our paragraph tags
         translated_html = tikal_output + f".html.p.translated"
         out = subprocess.run([TIKAL_PATH+'tikal.sh', '-lm', tikal_output + f".html.p", '-fc', profile_html, '-sl', src, '-tl', tgt, '-overtrg', '-from', translated_text_path, '-to', translated_html], stdout=subprocess.DEVNULL)
@@ -236,7 +236,7 @@ class Document(Translatable):
         def _unwrap_p_tags(line):
             stripped_line = line.rstrip('\n')
             return stripped_line[3:-4] + "\n"
-        
+
         def _unwrap_p_tags_and_escape(line):
             return escape(escape(_unwrap_p_tags(line)))
 
@@ -255,7 +255,7 @@ class Document(Translatable):
         os.remove(translated_text_path)
         os.remove(translated_html)
 
-    def _extract_translate_merge_document(self, src, tgt, method, model, custom_prompt=None, split=True, all_inline=False, replace_newlines=True):
+    def _extract_translate_merge_document(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True, all_inline=False):
         all_inline=True
         # run Tikal to extract text for translation
         tikal_command=[TIKAL_PATH+'tikal.sh', '-xm', self.orig_full_path, '-sl', src, '-to', self.orig_full_path]
@@ -270,7 +270,7 @@ class Document(Translatable):
         self.text = open(tikal_output).read()
 
         # translate the text
-        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
+        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
         translated_text_path = f"{self.orig_full_path}.{tgt}"
 
         # TODO: Can this ever work?
@@ -297,7 +297,7 @@ class Document(Translatable):
         os.remove(tikal_output)
         os.remove(translated_text_path)
 
-    def _extract_translate_merge_pdf(self, src, tgt, method, model=None, custom_prompt=None, split=True, replace_newlines=True):
+    def _extract_translate_merge_pdf(self, src, tgt, method, model=None, custom_prompt=None, terms=None):
         # open the PDF file
         self.pdf_editor = PdfEditor(self.orig_full_path)
 
@@ -309,9 +309,9 @@ class Document(Translatable):
         assert "\n" not in input_text
         input_text = input_text.replace("<page-break />", "\n")
         self.text = input_text
-        
+
         # translate the text
-        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
+        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
 
         # split the translation into lines
         translated_lines = self.translation.replace("\n", "<page-break />").split("<lb />")
@@ -321,7 +321,7 @@ class Document(Translatable):
         self.translated_path = self.get_translated_path(tgt)
         self.pdf_editor.merge_text(translated_lines, self.translated_path)
 
-    def _translate(self, src, tgt, method, model=None, custom_prompt=None, split=True, replace_newlines=True):
+    def _translate(self, src, tgt, method, model=None, custom_prompt=None, terms=None, split=True):
         # count words and check length (without tags)by
         text_without_tags = re.sub(r'<[^>]*>', '', self.text)
         self._input_word_count = count_words(text_without_tags)
@@ -336,7 +336,7 @@ class Document(Translatable):
             api.abort(code=413, message='The total text length in the document exceeds the translation limit.')
 
         # initialize translation pipeline
-        translator = InnerLindatTranslator(method, src, tgt, model, custom_prompt=custom_prompt, split=split, replace_newlines=replace_newlines)
+        translator = InnerLindatTranslator(method, src, tgt, model, custom_prompt=custom_prompt, terms=terms, split=split)
         aligner = LindatAligner(src, tgt, show_progress=False)
         tokenizer = RegexTokenizer()
         mt = MarkupTranslator(translator, aligner, tokenizer)
