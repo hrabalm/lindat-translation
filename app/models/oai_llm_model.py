@@ -75,8 +75,6 @@ class OaiLLMModel(models.Model):
             max_completion_tokens=self.max_completion_tokens,
         )
             out=completion.choices[0].message.content
-            if replace_newlines:
-                out=out.replace('\n', ' ')
             tgt_context.append(out)
             chars=0
             #only keep max the last 4000 characters

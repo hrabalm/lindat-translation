@@ -107,7 +107,7 @@
     "batch_size": 256,
     "token": "token-abc123",
     "server": "http://llmtranslate-1:8000",
-    "prompt": "Translate the following {src} source text to {tgt}:\n{src}: {text}\n{tgt}: ",
+    "prompt": "Translate the following {src} source text to {tgt}:\n{src}: {sentence}\n{tgt}: ",
     "max_completion_tokens": 256,
     "temperature": 0.05
   }
