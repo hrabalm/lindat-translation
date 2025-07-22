@@ -67,28 +67,15 @@ class OaiLLMModel(models.Model):
             print("Prompt: ", prompt, flush=True, file=sys.stderr)
 
             completion = self.client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "user", "content": prompt},
-            ],
-            temperature=self.temperature,
-            max_completion_tokens=self.max_completion_tokens,
-        )
-            out=completion.choices[0].message.content
-            tgt_context.append(out)
-            chars=0
-            #only keep max the last 4000 characters
-            for tgt_context_line in tgt_context:
-                chars+=len(tgt_context_line)
-            if len(out)>4000:
-                tgt_context=[out[-4000:]]
-            else:
-                while chars+len(tgt_context_line)>4000:
-                    tgt_context=tgt_context[1:]
-                    chars=len(''.join(tgt_context))
-                    print("Removing first line from tgt_context", flush=True, file=sys.stderr)
-
-            res.append(out)
+                model=model,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self.temperature,
+                max_completion_tokens=self.max_completion_tokens,
+            )
+            #TODO: FIX THIS REPLACE!!!!
+            res.append(completion.choices[0].message.content.replace('\n', ' '))
 
         print("Result: ", '\n'.join(res), flush=True, file=sys.stderr)
         return res
