@@ -203,12 +203,13 @@ class Document(Translatable):
         os.remove(translated_text_path)
         os.remove(translated_html)
 
-    def _extract_translate_merge_document(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True, all_inline=False):
-        all_inline=True
+    def _extract_translate_merge_document(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
         # run Tikal to extract text for translation
         tikal_command=[TIKAL_PATH+'tikal.sh', '-xm', self.orig_full_path, '-sl', src, '-to', self.orig_full_path]
         if self.orig_full_path.endswith(".inxml"):
             tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline"])
+        elif self.orig_full_path.endswith(".innopxml"):
+            tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline_not_paragraphs"])
         out = subprocess.run(tikal_command, stdout=subprocess.DEVNULL)
         assert out.returncode == 0
         tikal_output = f"{self.orig_full_path}.{src}"
@@ -236,7 +237,8 @@ class Document(Translatable):
         tikal_command=[TIKAL_PATH+'tikal.sh', '-lm', self.orig_full_path, '-sl', src, '-tl', tgt, '-overtrg', '-from', translated_text_path, '-to', self.translated_path]
         if self.orig_full_path.endswith(".inxml"):
             tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline"])
-
+        elif self.orig_full_path.endswith(".innopxml"):
+            tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline_not_paragraphs"])
         out = subprocess.run(tikal_command, stdout=sys.stderr)
         assert out.returncode == 0
         assert os.path.exists(self.translated_path)
