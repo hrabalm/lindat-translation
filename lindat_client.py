@@ -34,6 +34,8 @@ def translate_text(src_lang, tgt_lang, text, model, tags, prompt, base_url):
         data = {"src": src_lang, "tgt": tgt_lang}
         if prompt:
             data["prompt"] = prompt
+        else:
+            data["prompt"] = "Translate the following text from {src} to {tgt}: {sentence}"
         response = requests.post(url, files=files, data=data)
         if response.status_code == 200:
         # Remove XML wrapper if it was added
