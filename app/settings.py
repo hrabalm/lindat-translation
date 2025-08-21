@@ -30,6 +30,7 @@ DOCLVL_LOAD_BALANCED = '10.10.51.76:9000'
 UPLOAD_FOLDER = '/tmp/translator_uploads'
 
 # These should match with the appropriate constants in the frontend
-ALLOWED_EXTENSIONS = {'inxml', 'txt', 'xml', 'html', 'htm', 'docx', 'odt', 'pptx', 'odp', 'xlsx', 'ods', 'pdf', 'srt', 'md', 'xlf', 'json', 'yaml'}
+# inxml, innopxml are our custom XML formats for ČTK that treasts all tags/all tags except <p> as inline tags
+ALLOWED_EXTENSIONS = {'inxml', 'innopxml', 'txt', 'xml', 'html', 'htm', 'docx', 'odt', 'pptx', 'odp', 'xlsx', 'ods', 'pdf', 'srt', 'md', 'xlf', 'json', 'yaml'}
 
 TIKAL_PATH='/home/jon/okapi-apps/'
