@@ -1,12 +1,17 @@
 from math import ceil
 from pprint import pformat
+import os
 
 import numpy as np
 from flask import current_app, session
 from tensor2tensor.serving import serving_utils
-from tensor2tensor.utils import registry
+from tensor2tensor.utils import registry, usr_dir, hparam
 
 import app.models as models
+
+if models.hparams is None:
+    usr_dir.import_usr_dir('t2t_usr_dir')
+    models.hparams = hparam.HParams(data_dir=os.path.expanduser('t2t_data_dir'))
 from app.text_utils import split_text_into_sentences
 
 

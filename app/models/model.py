@@ -2,15 +2,12 @@ import os
 import logging
 from flask import current_app
 from iso639 import to_name
-from tensor2tensor.utils import usr_dir, hparam
 
 from app.dict_utils import get_or_create
-import app.models as models
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
-usr_dir.import_usr_dir('t2t_usr_dir')
-hparams = hparam.HParams(data_dir=os.path.expanduser('t2t_data_dir'))
+hparams = None
 
 
 class Model(object):
@@ -19,14 +16,19 @@ class Model(object):
     def create(cfg):
         if 'model_framework' in cfg:
             if cfg['model_framework'] == 'marian':
-                return models.MarianModel(cfg)
+                from .marian_model import MarianModel
+                return MarianModel(cfg)
             elif cfg['model_framework'] == 'tensorflow_doclevel':
-                return models.T2TDocModel(cfg)
+                from .t2t_model import T2TDocModel
+                return T2TDocModel(cfg)
             elif cfg['model_framework'] == 'tensorflow_with_scores':
-                return models.T2TModelWithScores(cfg)
+                from .t2t_model import T2TModelWithScores
+                return T2TModelWithScores(cfg)
             elif cfg['model_framework'] == 'oai_llm':
-                return models.OaiLLMModel(cfg)
-        return models.T2TModel(cfg)
+                from .oai_llm_model import OaiLLMModel
+                return OaiLLMModel(cfg)
+        from .t2t_model import T2TModel
+        return T2TModel(cfg)
 
     @staticmethod
     def lang_list_display(lang_list):
@@ -168,5 +170,3 @@ class Model(object):
             if i >= 0:
                 outputs[i] += '\n'
         return outputs
-
-
