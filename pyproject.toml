@@ -1,0 +1,38 @@
+[project]
+name = "lindat-translation"
+version = "0.1.0"
+description = "Flask frontend for translation services"
+requires-python = ">=3.9,<3.12"
+dependencies = [
+    "document-translation @ git+https://github.com/kukas/document-translation",
+    "eventlet",
+    "flask",
+    "flask-bootstrap",
+    "flask-restx",
+    "flask-script",
+    "flask-wtf",
+    "gunicorn",
+    "networkx",
+    "numpy==1.23.5",
+    "openai",
+    # The application uses the `iso639.to_name` API provided by this package.
+    "iso639==0.1.4",
+    "requests",
+    "sentencepiece",
+    "sentence-splitter",
+    "tensorflow==2.13.1",
+    "tensorflow-serving-api==2.13.1",
+    "tensor2tensor",
+    "websocket-client",
+    "werkzeug",
+    "markupsafe",
+]
+
+[dependency-groups]
+dev = [
+    "swagger-parser",
+    "swagger-tester",
+]
+
+[tool.uv]
+package = false

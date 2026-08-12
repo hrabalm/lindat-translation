@@ -5,6 +5,14 @@ In our setup the flask app runs on a machine called `transformer` and tensorflow
 
 ## Install
 
+### uv
+```sh
+uv sync --dev
+source .venv/bin/activate
+```
+
+The application can then be started with `uv run gunicorn -t 500 -k sync -w 12 -b 0.0.0.0:5000 uwsgi:app`.
+
 ### To install[^1] and run frontend
 ```
 git clone --recurse-submodules git@github.com:ufal/transformer_frontend
