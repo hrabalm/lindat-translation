@@ -73,6 +73,7 @@ class OaiLLMModel(models.Model):
                 ],
                 temperature=self.temperature,
                 max_completion_tokens=self.max_completion_tokens,
+                stop=["###"], # workaround for EdUKate models
             )
             #TODO: FIX THIS REPLACE!!!!
             res.append(completion.choices[0].message.content.replace('\n', ' '))

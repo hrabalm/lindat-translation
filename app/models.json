@@ -22,6 +22,48 @@
   },
   {
     "source": [
+      "cs"
+    ],
+    "target": [
+      "en"
+    ],
+    "weight": 0.1,
+    "domain": "",
+    "provider": "ufal",
+    "model": "edukate_csen_v1",
+    "display": "EduKate",
+    "ignore_tags": false,
+    "model_framework": "oai_llm",
+    "batch_size": 256,
+    "token": "token-abc123",
+    "server": "http://llmtranslate-1:8000",
+    "prompt": "### Instruction\nTranslate Input from {src} to {tgt}\n### Input\n{sentence}\n### Response\n",
+    "max_completion_tokens": 256,
+    "temperature": 0.0
+  },
+  {
+    "source": [
+      "cs"
+    ],
+    "target": [
+      "de"
+    ],
+    "weight": 0.1,
+    "domain": "",
+    "provider": "ufal",
+    "model": "edukate_csde_v1",
+    "display": "EduKate",
+    "ignore_tags": false,
+    "model_framework": "oai_llm",
+    "batch_size": 256,
+    "token": "token-abc123",
+    "server": "http://llmtranslate-1:8000",
+    "prompt": "### Instruction\nTranslate Input from {src} to {tgt}\n### Input\n{sentence}\n### Response\n",
+    "max_completion_tokens": 256,
+    "temperature": 0.0
+  },
+  {
+    "source": [
       "bg",
       "hr",
       "cs",
@@ -110,5 +152,67 @@
     "prompt": "Translate the following {src} source text to {tgt}:\n{src}: {sentence}\n{tgt}: ",
     "max_completion_tokens": 256,
     "temperature": 0.05
+  },
+  {
+    "source": [
+      "ar",
+      "zh",
+      "cs",
+      "nl",
+      "en",
+      "fr",
+      "de",
+      "el",
+      "he",
+      "hi",
+      "id",
+      "it",
+      "ja",
+      "ko",
+      "fa",
+      "pl",
+      "pt",
+      "ro",
+      "ru",
+      "es",
+      "tr",
+      "uk",
+      "vi"
+    ],
+    "target": [
+      "ar",
+      "zh",
+      "cs",
+      "nl",
+      "en",
+      "fr",
+      "de",
+      "el",
+      "he",
+      "hi",
+      "id",
+      "it",
+      "ja",
+      "ko",
+      "fa",
+      "pl",
+      "pt",
+      "ro",
+      "ru",
+      "es",
+      "tr",
+      "uk",
+      "vi"
+    ],
+    "weight": 0.1,
+    "domain": "",
+    "provider": "CohereLabs",
+    "model": "aya-expanse-8b",
+    "display": "LLM test",
+    "ignore_tags": false,
+    "model_framework": "oai_llm",
+    "batch_size": 256,
+    "token": "token-abc123",
+    "server": "http://llmtranslate-1:8000"
   }
 ]
