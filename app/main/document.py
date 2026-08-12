@@ -1,29 +1,265 @@
 import os
+import re
 import subprocess
 import sys
-import re
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from html import escape, unescape
+from typing import Callable, Dict, List, Optional, Tuple
 from unicodedata import normalize
 
-from flask import send_from_directory
-from flask import request
-
-from app.settings import ALLOWED_EXTENSIONS, UPLOAD_FOLDER, MAX_TEXT_LENGTH, TIKAL_PATH
+from flask import request, send_from_directory
 from werkzeug.utils import secure_filename
+
 from app.main.api.restplus import api
-
-from app.text_utils import count_words
-from app.main.translate import translate_from_to, translate_with_model
 from app.main.api.translation.parsers import text_input_with_src_tgt
-
+from app.main.translate import translate_from_to, translate_with_model
 from app.main.translatable import Translatable
-from document_translation.markuptranslator import MarkupTranslator, Translator
+from app.settings import ALLOWED_EXTENSIONS, MAX_TEXT_LENGTH, TIKAL_PATH, UPLOAD_FOLDER
+from app.text_utils import count_words
 from document_translation.lindat_services.align import LindatAligner
-from document_translation.regextokenizer import RegexTokenizer
+from document_translation.markuptranslator import MarkupTranslator, Translator
 from document_translation.pdf_tools.pdfeditor import PdfEditor
+from document_translation.regextokenizer import RegexTokenizer
 
-import xml.etree.ElementTree as ET
-from html import unescape, escape
+
+def fix_fraus_encoding(line: str) -> str:
+    if line.startswith('<?xml version="1.0" encoding="utf-16"?>'):
+        return line.replace("utf-16", "utf-8")
+    return line
+
+
+def unescape_extracted_line(line: str) -> str:
+    return unescape(unescape(line)).replace("&nbsp;", " ")
+
+
+def wrap_paragraph(line: str) -> str:
+    return f"<p>{line.rstrip(chr(10))}</p>\n"
+
+
+def unwrap_and_escape(line: str) -> str:
+    stripped = line.rstrip("\n")
+    return escape(escape(stripped[3:-4] + "\n"))
+
+
+def transform_file(input_path: str, output_path: str,
+                   transform: Callable[[str], str]) -> None:
+    with open(input_path, "r", encoding="utf-8") as source, open(
+            output_path, "w", encoding="utf-8") as destination:
+        for line in source:
+            destination.write(transform(line))
+
+
+def read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as source:
+        return source.read()
+
+
+class TikalError(RuntimeError):
+    pass
+
+
+class TikalRunner:
+    def __init__(self, tikal_path: str, run=subprocess.run):
+        self.tikal_path = tikal_path
+        self._run = run
+
+    def run(self, mode: str, input_path: str, output_path: str, src: str,
+            tgt: Optional[str] = None, profile: Optional[str] = None,
+            translation_path: Optional[str] = None,
+            profile_at_end: bool = False,
+            stdout=None,
+            expected_output_path: Optional[str] = None) -> str:
+        command = [self.tikal_path + "tikal.sh", mode, input_path]
+        if profile and not profile_at_end:
+            command.extend(["-fc", profile])
+        command.extend(["-sl", src])
+        if tgt:
+            command.extend(["-tl", tgt, "-overtrg"])
+        if translation_path:
+            command.extend(["-from", translation_path])
+        command.extend(["-to", output_path])
+        if profile and profile_at_end:
+            command.extend(["-fc", profile])
+        result = self._run(command, stdout=subprocess.DEVNULL if stdout is None else stdout)
+        if result.returncode != 0:
+            raise TikalError(f"Tikal failed with exit code {result.returncode}")
+        expected = expected_output_path or output_path
+        if not os.path.exists(expected):
+            raise TikalError(f"Tikal did not create expected output: {expected}")
+        return expected
+
+
+@dataclass
+class PipelineResult:
+    output_path: str
+    text: str
+    trace: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PipelineContext:
+    input_path: str
+    output_path: str
+    src: str
+    tgt: str
+    artifacts: Dict[str, str]
+
+
+@dataclass
+class PipelineStage:
+    name: str
+    run: Callable[[PipelineContext], Optional[str]]
+
+
+class DocumentFormat:
+    def stages(self, context: PipelineContext) -> List[PipelineStage]:
+        raise NotImplementedError
+
+
+class StandardDocumentFormat(DocumentFormat):
+    def __init__(self, runner: TikalRunner, profile: Optional[str] = None):
+        self.runner = runner
+        self.profile = profile
+
+    def stages(self, context: PipelineContext) -> List[PipelineStage]:
+        source = context.input_path
+        extracted = source + "." + context.src
+        translated = source + "." + context.tgt
+
+        def extract(ctx):
+            self.runner.run("-xm", source, source, ctx.src, profile=self.profile,
+                            profile_at_end=True, expected_output_path=extracted)
+            ctx.artifacts["extracted"] = extracted
+            return read_text(extracted)
+
+        def translate(ctx):
+            ctx.artifacts["translation"] = translated
+            return read_text(extracted)
+
+        def merge(ctx):
+            self.runner.run("-lm", source, ctx.output_path, ctx.src, ctx.tgt,
+                            profile=self.profile, translation_path=translated,
+                            profile_at_end=True, stdout=sys.stderr)
+            # Standard document outputs may be binary (for example ODT/DOCX).
+            return ctx.output_path
+
+        return [PipelineStage("extract", extract),
+                PipelineStage("translate", translate),
+                PipelineStage("merge", merge)]
+
+
+class FrausDocumentFormat(DocumentFormat):
+    def __init__(self, runner: TikalRunner, xml_profile: str, html_profile: str):
+        self.runner = runner
+        self.xml_profile = xml_profile
+        self.html_profile = html_profile
+
+    def stages(self, context: PipelineContext) -> List[PipelineStage]:
+        source = context.input_path
+        fixed = source + ".fixed"
+        xml_extracted = fixed + "." + context.src
+        html_unescaped = xml_extracted + ".html"
+        paragraphs = html_unescaped + ".p"
+        extracted = paragraphs + "." + context.src
+        translated = paragraphs + "." + context.tgt
+        html_translated = paragraphs + ".translated"
+        xml_translated = fixed + ".translated"
+
+        def fix_encoding(ctx):
+            transform_file(source, fixed, fix_fraus_encoding)
+            ctx.artifacts["fixed_xml"] = fixed
+            return read_text(fixed)
+
+        def extract_xml(ctx):
+            self.runner.run("-xm", fixed, fixed, ctx.src, profile=self.xml_profile,
+                            expected_output_path=xml_extracted)
+            ctx.artifacts["xml_extracted"] = xml_extracted
+            return read_text(xml_extracted)
+
+        def unescape_html(ctx):
+            transform_file(xml_extracted, html_unescaped, unescape_extracted_line)
+            ctx.artifacts["unescaped_html"] = html_unescaped
+            return read_text(html_unescaped)
+
+        def wrap(ctx):
+            transform_file(html_unescaped, paragraphs, wrap_paragraph)
+            ctx.artifacts["paragraph_html"] = paragraphs
+            return read_text(paragraphs)
+
+        def extract_html(ctx):
+            self.runner.run("-xm", paragraphs, paragraphs, ctx.src,
+                            profile=self.html_profile,
+                            expected_output_path=extracted)
+            ctx.artifacts["html_extracted"] = extracted
+            return read_text(extracted)
+
+        def translate(ctx):
+            ctx.artifacts["translation"] = translated
+            return read_text(extracted)
+
+        def merge_html(ctx):
+            self.runner.run("-lm", paragraphs, html_translated, ctx.src, ctx.tgt,
+                            profile=self.html_profile, translation_path=translated)
+            return read_text(html_translated)
+
+        def escape_xml(ctx):
+            transform_file(html_translated, xml_translated, unwrap_and_escape)
+            ctx.artifacts["xml_translation"] = xml_translated
+            return read_text(xml_translated)
+
+        def merge_xml(ctx):
+            self.runner.run("-lm", fixed, ctx.output_path, ctx.src, ctx.tgt,
+                            profile=self.xml_profile, translation_path=xml_translated)
+            return read_text(ctx.output_path)
+
+        return [PipelineStage("fix_encoding", fix_encoding),
+                PipelineStage("extract_xml", extract_xml),
+                PipelineStage("unescape_html", unescape_html),
+                PipelineStage("wrap_paragraphs", wrap),
+                PipelineStage("extract_html", extract_html),
+                PipelineStage("translate", translate),
+                PipelineStage("merge_html", merge_html),
+                PipelineStage("escape_xml", escape_xml),
+                PipelineStage("merge_xml", merge_xml)]
+
+
+class DocumentPipeline:
+    def __init__(self, document_format: DocumentFormat, debug: bool = False):
+        self.document_format = document_format
+        self.debug = debug
+
+    def run(self, input_path: str, output_path: str, src: str, tgt: str,
+            translate: Callable[[str], str], debug: Optional[bool] = None) -> PipelineResult:
+        if debug is not None:
+            self.debug = debug
+        context = PipelineContext(input_path, output_path, src, tgt, {})
+        trace: Dict[str, str] = {}
+        translation_text = ""
+        generated = set()
+        try:
+            for stage in self.document_format.stages(context):
+                if stage.name == "translate":
+                    extracted = stage.run(context) or ""
+                    translation_text = translate(extracted)
+                    path = context.artifacts["translation"]
+                    with open(path, "w", encoding="utf-8") as destination:
+                        destination.write(translation_text)
+                    value = translation_text
+                else:
+                    value = stage.run(context) or ""
+                generated.update(context.artifacts.values())
+                if self.debug:
+                    trace[stage.name] = value
+                    print(f"[document] stage={stage.name}\n{value}", file=sys.stderr)
+            return PipelineResult(output_path, translation_text, trace)
+        finally:
+            generated.update(context.artifacts.values())
+            for path in generated:
+                if path != output_path and os.path.exists(path):
+                    os.remove(path)
+            if os.path.exists(input_path) and os.path.exists(output_path):
+                os.remove(input_path)
+
 
 class InnerLindatTranslator(Translator):
     def __init__(self, method, src, tgt, model=None, custom_prompt=None, terms=None, split=True):
@@ -35,45 +271,45 @@ class InnerLindatTranslator(Translator):
         self.custom_prompt = custom_prompt
 
     def translate(self, input_text: str, split=True) -> Tuple[List[str], List[str]]:
-        # translator does not like leading newlines, so we remove them and add them back later
         num_prefix_newlines = 0
         if input_text.startswith("\n"):
             while input_text[num_prefix_newlines] == "\n":
                 num_prefix_newlines += 1
+        if num_prefix_newlines:
             input_text = input_text[num_prefix_newlines:]
+
         num_suffix_newlines = 0
         if input_text.endswith("\n"):
             while input_text[-1 - num_suffix_newlines] == "\n":
                 num_suffix_newlines += 1
+        if num_suffix_newlines:
             input_text = input_text[:-num_suffix_newlines]
 
-        # here we translate the text
         if self.method == "with_model":
-            src_sentences, tgt_sentences = translate_with_model(self.model, input_text, self.src, self.tgt, return_source_sentences=True, custom_prompt=self.custom_prompt, split=split)
+            src_sentences, tgt_sentences = translate_with_model(
+                self.model, input_text, self.src, self.tgt,
+                return_source_sentences=True, custom_prompt=self.custom_prompt,
+                split=split,
+            )
         else:
-            src_sentences, tgt_sentences = translate_from_to(self.src, self.tgt, input_text, return_source_sentences=True, custom_prompt=self.custom_prompt, split=split)
+            src_sentences, tgt_sentences = translate_from_to(
+                self.src, self.tgt, input_text, return_source_sentences=True,
+                custom_prompt=self.custom_prompt, split=split,
+            )
 
-        # post process the translation
         if tgt_sentences:
-            # if the line was empty or whitespace-only, then discard any potential translation
-            new_tgt_sentences: List[str] = []
-            for src, tgt in zip(src_sentences, tgt_sentences):
-                if re.match(r"^\s+$", src):
-                    new_tgt_sentences.append(src)
-                else:
-                    new_tgt_sentences.append(tgt)
-            tgt_sentences = new_tgt_sentences
-            # reinsert prefix newlines
+            tgt_sentences = [
+                src if re.match(r"^\s+$", src) else tgt
+                for src, tgt in zip(src_sentences, tgt_sentences)
+            ]
             src_sentences[0] = "\n" * num_prefix_newlines + src_sentences[0]
             tgt_sentences[0] = "\n" * num_prefix_newlines + tgt_sentences[0]
-            # reinsert suffix newlines
             src_sentences[-1] = src_sentences[-1].rstrip("\n") + "\n" * num_suffix_newlines
             tgt_sentences[-1] = tgt_sentences[-1].rstrip("\n") + "\n" * num_suffix_newlines
-            # add spaces after sentence ends
-            src_sentences = [src_sentence + " " if not src_sentence.endswith("\n") else src_sentence for src_sentence in src_sentences]
-            tgt_sentences = [tgt_sentence + " " if not tgt_sentence.endswith("\n") else tgt_sentence for tgt_sentence in tgt_sentences]
-
+            src_sentences = [s + " " if not s.endswith("\n") else s for s in src_sentences]
+            tgt_sentences = [s + " " if not s.endswith("\n") else s for s in tgt_sentences]
         return src_sentences, tgt_sentences
+
 
 class Document(Translatable):
     def __init__(self, orig_full_path):
@@ -82,279 +318,99 @@ class Document(Translatable):
         self._input_word_count = 0
         self._output_word_count = 0
         self._input_nfc_len = 0
+        self.debug_trace = {}
 
     @classmethod
     def from_file(cls, request_file):
         if not request_file:
             api.abort(code=400, message='Empty file')
-
         if not cls.allowed_file(request_file.filename):
             api.abort(code=415, message='Unsupported file type for translation')
-
         filename = secure_filename(request_file.filename)
-
         os.makedirs(UPLOAD_FOLDER, exist_ok=True)
         orig_full_path = os.path.join(UPLOAD_FOLDER, filename)
         request_file.save(orig_full_path)
-
         return cls(orig_full_path)
 
     @classmethod
     def allowed_file(cls, filename):
-        extension_check = '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-        return extension_check
+        return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
     def translate_from_to(self, src, tgt, custom_prompt=None, terms=None, split=True):
-        self._extract_translate_merge(src, tgt, "from_to", None, custom_prompt=custom_prompt, terms=terms, split=split)
+        self._extract_translate_merge(src, tgt, "from_to", None, custom_prompt, terms, split)
 
     def translate_with_model(self, model, src, tgt, custom_prompt=None, terms=None, split=True):
-        self._extract_translate_merge(src, tgt, "with_model", model, custom_prompt=custom_prompt, terms=terms, split=split)
+        self._extract_translate_merge(src, tgt, "with_model", model, custom_prompt, terms, split)
 
     def _extract_translate_merge(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
         if self.orig_full_path.endswith('.pdf'):
-            self._extract_translate_merge_pdf(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
-        else:
-            args = text_input_with_src_tgt.parse_args(request)
-            if args.get('fraus', False):
-                self._extract_translate_merge_fraus(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
-            else:
-                self._extract_translate_merge_document(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
+            return self._extract_translate_merge_pdf(src, tgt, method, model, custom_prompt, terms, split)
+        args = text_input_with_src_tgt.parse_args(request)
+        if args.get('fraus', False):
+            return self._extract_translate_merge_fraus(src, tgt, method, model, custom_prompt, terms, split)
+        return self._extract_translate_merge_document(src, tgt, method, model, custom_prompt, terms, split)
 
     def get_translated_path(self, tgt):
         orig_root, file_extension = os.path.splitext(self.orig_full_path)
         return f"{orig_root}.{tgt}{file_extension}"
 
     def _extract_translate_merge_fraus(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
-        def fix_fraus_encoding(input_file, output_file):
-            with open(input_file, 'r', encoding='utf-8') as f_in, open(output_file, 'w', encoding='utf-8') as f_out:
-                for line in f_in:
-                    if line.startswith('<?xml version="1.0" encoding="utf-16"?>'):
-                        line = line.replace("utf-16", "utf-8")
-                    f_out.write(line)
-
-        def transform_lines(input_file, output_file, fun):
-            with open(input_file, 'r', encoding='utf-8') as f_in, open(output_file, 'w', encoding='utf-8') as f_out:
-                for line in f_in:
-                    line = fun(line)
-                    f_out.write(line)
-
-        # import re
-        # import html
-        # import base64
-
-        # def b64encode(text):
-        #     """Encode text to base64."""
-        #     return base64.b64encode(text.encode('utf-8')).decode('utf-8')
-
-        # def b64decode(text):
-        #     """Decode base64 text."""
-        #     return base64.b64decode(text.encode('utf-8')).decode('utf-8')
-
-        # def custom_unescape(text):
-        #     escaped_tag_pattern = r'(&lt;(?P<content>.+?)&gt;)'
-        #     return re.sub(escaped_tag_pattern, lambda m: f"<DOUBLE content=\"{b64encode(m.group('content'))}\"/>", text)
-
-        # def custom_escape(text):
-        #     def replace_double_tag(match):
-        #         content = match.group('content')
-        #         return f"&lt;{b64decode(content)}&gt;"
-
-        #     return re.sub(r'<DOUBLE content="(?P<content>.+?)"/>', replace_double_tag, text)
-
-        # def fraus_double_unescape(text):
-        #     """We try to unescape while keeping track of tags which were escaped twice."""
-        #     first_pass = html.unescape(text)
-        #     second_pass = custom_unescape(first_pass)
-        #     third_pass = html.unescape(second_pass)
-        #     return third_pass
-
-        # def fraus_reescape(text):
-        #     first_pass = custom_escape(text)
-        #     second_pass = html.escape(first_pass)
-        #     return second_pass
-
-        # fix the wrong encoding in the FRAUS XML
-        xml_path = self.orig_full_path+".fixed"
-        fix_fraus_encoding(self.orig_full_path, xml_path)
-
-        # path to the `app` directory based on the current file
         app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        profile_xml = os.path.join(app_dir, 'okapi_profiles', 'okf_xml@fraus.fprm')
-
-        # run Tikal first time to extract text and encoded html tags from the FRAUS XML
-        out = subprocess.run([TIKAL_PATH+'tikal.sh', '-xm', xml_path, '-fc', profile_xml, '-sl', src, '-to', xml_path], stdout=subprocess.DEVNULL)
-        assert out.returncode == 0
-        tikal_output = f"{xml_path}.{src}"
-        assert os.path.exists(tikal_output)
-
-        # unescape the extracted text to reveal the html tags
-        # FIXME: currently, we do this twice, but the output is escaped only one
-        #        so it remains to be seen whether this is ok
-        # transform_lines(tikal_output, tikal_output+".html.1st", unescape)
-        # transform_lines(tikal_output+".html.1st", tikal_output+".html", unescape)
-
-        def _double_unescape_and_nbsp(text):
-            # also handles the &nbsp
-
-            # note that \xa0 is handled by ufal/document-translation, so we
-            # don't have to handle it here
-            return unescape(unescape(text)).replace("&nbsp;", " ")
-
-        transform_lines(tikal_output, tikal_output+".html", _double_unescape_and_nbsp)
-
-        # wrap each line in <p> tags to make them separate paragraphs
-        def _wrap_in_p_tags(line):
-            line_stripped = line.rstrip('\n')
-            return f"<p>{line_stripped}</p>\n"
-        transform_lines(tikal_output+".html", tikal_output+".html.p", _wrap_in_p_tags)
-
-        # run Tikal again to extract the text within the html tags
-        profile_html = os.path.join(app_dir, 'okapi_profiles', 'okf_html@fraus.fprm')
-        out = subprocess.run([TIKAL_PATH+'tikal.sh', '-xm', tikal_output+".html.p", '-fc', profile_html, '-sl', src, '-to', tikal_output+".html.p"], stdout=subprocess.DEVNULL)
-        assert out.returncode == 0
-        tikal_output_2nd = tikal_output+f".html.p.{src}"
-        assert os.path.exists(tikal_output_2nd)
-
-        # read the extracted text
-        self.text = open(tikal_output_2nd).read()
-
-        # translate the text
-        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
-
-        # write translation to file
-        translated_text_path = tikal_output + f".html.p.{tgt}"
-        with open(translated_text_path, 'w') as f:
-            f.write(self.translation)
-
-        # reinsert translation into our paragraph tags
-        translated_html = tikal_output + f".html.p.translated"
-        out = subprocess.run([TIKAL_PATH+'tikal.sh', '-lm', tikal_output + f".html.p", '-fc', profile_html, '-sl', src, '-tl', tgt, '-overtrg', '-from', translated_text_path, '-to', translated_html], stdout=subprocess.DEVNULL)
-        assert out.returncode == 0
-        assert os.path.exists(translated_html)
-
-        # unwrap the translated text from the <p> tags
-        def _unwrap_p_tags(line):
-            stripped_line = line.rstrip('\n')
-            return stripped_line[3:-4] + "\n"
-
-        def _unwrap_p_tags_and_escape(line):
-            return escape(escape(_unwrap_p_tags(line)))
-
-        transform_lines(translated_html, xml_path + ".translated", _unwrap_p_tags_and_escape)
-
-        # reinsert translation into FRAUS XML using Tikal
-        self.translated_path = self.get_translated_path(tgt)
-        out = subprocess.run([TIKAL_PATH+'tikal.sh', '-lm', xml_path, '-fc', profile_xml, '-sl', src, '-tl', tgt, '-overtrg', '-from', xml_path + ".translated", '-to', self.translated_path], stdout=subprocess.DEVNULL)
-        assert out.returncode == 0
-        assert os.path.exists(self.translated_path)
-        # clean up the temporary files
-        os.remove(self.orig_full_path)
-        os.remove(xml_path)
-        os.remove(tikal_output)
-        os.remove(tikal_output_2nd)
-        os.remove(translated_text_path)
-        os.remove(translated_html)
+        document_format = FrausDocumentFormat(
+            TikalRunner(TIKAL_PATH),
+            os.path.join(app_dir, 'okapi_profiles', 'okf_xml@fraus.fprm'),
+            os.path.join(app_dir, 'okapi_profiles', 'okf_html@fraus.fprm'),
+        )
+        self._run_document_pipeline(document_format, src, tgt, method, model, custom_prompt, terms, split)
 
     def _extract_translate_merge_document(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
-        # run Tikal to extract text for translation
-        tikal_command=[TIKAL_PATH+'tikal.sh', '-xm', self.orig_full_path, '-sl', src, '-to', self.orig_full_path]
+        profile = None
         if self.orig_full_path.endswith(".inxml"):
-            tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline"])
+            profile = TIKAL_PATH + "okf_xml@all_inline"
         elif self.orig_full_path.endswith(".innopxml"):
-            tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline_not_paragraphs"])
-        out = subprocess.run(tikal_command, stdout=subprocess.DEVNULL)
-        assert out.returncode == 0
-        tikal_output = f"{self.orig_full_path}.{src}"
-        assert os.path.exists(tikal_output)
+            profile = TIKAL_PATH + "okf_xml@all_inline_not_paragraphs"
+        self._run_document_pipeline(
+            StandardDocumentFormat(TikalRunner(TIKAL_PATH), profile),
+            src, tgt, method, model, custom_prompt, terms, split,
+        )
 
-        # read the extracted text from the uploaded file
-        self.text = open(tikal_output).read()
-
-        # translate the text
-        self._translate(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
-        translated_text_path = f"{self.orig_full_path}.{tgt}"
-
-        # TODO: Can this ever work?
-        # pattern = r"<ln id=(\d+)>(.*?)</ln>"
-        # matches = re.findall(pattern, self.translation, flags=re.DOTALL)
-        # sorted_matches = sorted(matches, key=lambda x: int(x[0]))
-        # restored_lines = [content for (_id, content) in sorted_matches]
-        #self.translation= "\n".join(restored_lines)
-
-        with open(translated_text_path, 'w') as f:
-            f.write(self.translation)#.replace(" NEWLINE ", "\n"))
-        print("final translation", self.translation)
-        # reinsert translation using Tikal
+    def _run_document_pipeline(self, document_format, src, tgt, method, model, custom_prompt, terms, split):
         self.translated_path = self.get_translated_path(tgt)
-        tikal_command=[TIKAL_PATH+'tikal.sh', '-lm', self.orig_full_path, '-sl', src, '-tl', tgt, '-overtrg', '-from', translated_text_path, '-to', self.translated_path]
-        if self.orig_full_path.endswith(".inxml"):
-            tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline"])
-        elif self.orig_full_path.endswith(".innopxml"):
-            tikal_command.extend(["-fc",TIKAL_PATH+"okf_xml@all_inline_not_paragraphs"])
-        out = subprocess.run(tikal_command, stdout=sys.stderr)
-        assert out.returncode == 0
-        assert os.path.exists(self.translated_path)
-        # clean up the temporary files
-        os.remove(self.orig_full_path)
-        os.remove(tikal_output)
-        os.remove(translated_text_path)
 
-    def _extract_translate_merge_pdf(self, src, tgt, method, model=None, custom_prompt=None, terms=None):
-        # open the PDF file
+        def translate(text):
+            self.text = text
+            self._translate(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
+            return self.translation
+
+        result = DocumentPipeline(document_format).run(
+            self.orig_full_path, self.translated_path, src, tgt, translate,
+            debug=str(request.values.get('debug', '')).lower() in {'1', 'true', 'yes'},
+        )
+        self.translation = result.text
+        self.debug_trace = result.trace
+
+    def _extract_translate_merge_pdf(self, src, tgt, method, model=None, custom_prompt=None, terms=None, split=True):
         self.pdf_editor = PdfEditor(self.orig_full_path)
-
-        # extract the text from the PDF
         lines = self.pdf_editor.extract_text()
-
-        # join the extracted lines into a single string, separated by line breaks
         input_text = "<lb />".join(lines)
         assert "\n" not in input_text
-        input_text = input_text.replace("<page-break />", "\n")
-        self.text = input_text
-
-        # translate the text
+        self.text = input_text.replace("<page-break />", "\n")
         self._translate(src, tgt, method, model, custom_prompt=custom_prompt, terms=terms, split=split)
-
-        # split the translation into lines
         translated_lines = self.translation.replace("\n", "<page-break />").split("<lb />")
         assert len(lines) == len(translated_lines), f"{len(lines)} != {len(translated_lines)}"
-
-        # merge the translated text into the PDF
         self.translated_path = self.get_translated_path(tgt)
         self.pdf_editor.merge_text(translated_lines, self.translated_path)
 
     def _translate(self, src, tgt, method, model=None, custom_prompt=None, terms=None, split=True):
-        # count words and check length (without tags)by
         text_without_tags = re.sub(r'<[^>]*>', '', self.text)
         self._input_word_count = count_words(text_without_tags)
         self._input_nfc_len = len(normalize('NFC', self.text))
-
-        # check if we want to ignore the size limit
         args = text_input_with_src_tgt.parse_args(request)
-        ignore_size_limit = args.get('ignoreSizeLimit',False)
-
-        # check the document character count limit
-        if self._input_nfc_len >= MAX_TEXT_LENGTH and not ignore_size_limit:
+        if self._input_nfc_len >= MAX_TEXT_LENGTH and not args.get('ignoreSizeLimit', False):
             api.abort(code=413, message='The total text length in the document exceeds the translation limit.')
-
-        # initialize translation pipeline
         translator = InnerLindatTranslator(method, src, tgt, model, custom_prompt=custom_prompt, terms=terms, split=split)
-        aligner = LindatAligner(src, tgt, show_progress=False)
-        tokenizer = RegexTokenizer()
-        mt = MarkupTranslator(translator, aligner, tokenizer)
-
-        # translate the text (possibly with markup)
-
-        # TODO: Can this ever work?
-        wrapped_lines = []
-       # for i, line in enumerate(self.text.split('\n'), start=1):
-        #    wrapped_lines.append(f"<ln id={i}>{line}</ln>")
-
-        # Join the lines back together (with newlines, for example)
-       # self.text = "".join(wrapped_lines)
-        self.translation = mt.translate(self.text)#.replace("\n", "<lb />"))
-
-        # count words in translation
+        mt = MarkupTranslator(translator, LindatAligner(src, tgt, show_progress=False), RegexTokenizer())
+        self.translation = mt.translate(self.text)
         self._output_word_count = len(self.translation.split())
 
     def get_text(self):
@@ -364,12 +420,21 @@ class Document(Translatable):
         return self.translation
 
     def create_response(self, extra_headers):
-        headers = {
-            **self.prep_billing_headers(),
-            **extra_headers
-        }
-        basename = os.path.basename(self.translated_path)
-        response = send_from_directory(UPLOAD_FOLDER, basename)
-        response.headers.extend(headers)
+        if str(request.values.get('debug', '')).lower() in {'1', 'true', 'yes'}:
+            from flask import jsonify
+            import base64
+
+            with open(self.translated_path, 'rb') as translated_file:
+                output = base64.b64encode(translated_file.read()).decode('ascii')
+            response = jsonify({
+                'filename': os.path.basename(self.translated_path),
+                'output_base64': output,
+                'trace': self.debug_trace,
+            })
+            response.headers.extend({**self.prep_billing_headers(), **extra_headers})
+            os.remove(self.translated_path)
+            return response
+        response = send_from_directory(UPLOAD_FOLDER, os.path.basename(self.translated_path))
+        response.headers.extend({**self.prep_billing_headers(), **extra_headers})
         os.remove(self.translated_path)
         return response

@@ -33,4 +33,5 @@ UPLOAD_FOLDER = '/tmp/translator_uploads'
 # inxml, innopxml are our custom XML formats for ČTK that treasts all tags/all tags except <p> as inline tags
 ALLOWED_EXTENSIONS = {'inxml', 'innopxml', 'txt', 'xml', 'html', 'htm', 'docx', 'odt', 'pptx', 'odp', 'xlsx', 'ods', 'pdf', 'srt', 'md', 'xlf', 'json', 'yaml'}
 
-TIKAL_PATH='/home/jon/okapi-apps/'
+TIKAL_PATH = os.environ.get('TIKAL_PATH', '/home/jon/okapi-apps/')
+MODEL_SERVER = os.environ.get('MODEL_SERVER')

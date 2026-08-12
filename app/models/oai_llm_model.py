@@ -5,6 +5,7 @@ from websocket import create_connection
 import app.models as models
 from app.text_utils import split_text_into_sentences
 from openai import OpenAI
+import httpx
 import sys
 import iso639
 import logging
@@ -36,6 +37,9 @@ class OaiLLMModel(models.Model):
         self.client = OpenAI(
             base_url=f"{self.server}/v1",
             api_key=self.token,
+            # openai 1.5.0 passes the removed `proxies` argument to newer
+            # httpx versions. Supplying the client avoids that incompatibility.
+            http_client=httpx.Client(),
         )
         print("Connecting to '{}'".format(self.server), flush=True, file=sys.stderr)
         print("Sentences: ", sentences, flush=True, file=sys.stderr)
@@ -72,7 +76,7 @@ class OaiLLMModel(models.Model):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=self.temperature,
-                max_completion_tokens=self.max_completion_tokens,
+                max_tokens=self.max_completion_tokens,
                 stop=["###"], # workaround for EdUKate models
             )
             #TODO: FIX THIS REPLACE!!!!
