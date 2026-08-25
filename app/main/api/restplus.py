@@ -1,4 +1,4 @@
-from flask import make_response, render_template
+from flask import current_app, make_response, render_template
 from flask_restx import Api
 
 from app.models.llm_errors import LLMBackendError
@@ -10,6 +10,12 @@ api = Api(version='2.0', title='LINDAT Translation API', default_mediatype=None,
 
 @api.errorhandler(LLMBackendError)
 def handle_llm_backend_error(error):
+    current_app.logger.error(
+        "LLM backend failure status=%s error=%s detail=%s",
+        error.status_code,
+        type(error).__name__,
+        error,
+    )
     return {"message": error.public_message}, error.status_code
 
 

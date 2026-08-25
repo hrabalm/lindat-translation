@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 import unittest
 
@@ -25,9 +26,13 @@ class OaiLLMModelTests(unittest.TestCase):
         self.app = Flask(__name__)
         self.context = self.app.app_context()
         self.context.push()
+        self.llm_logger = logging.getLogger('app.models.oai_llm_model')
+        self.logger_was_disabled = self.llm_logger.disabled
+        self.llm_logger.disabled = True
 
     def tearDown(self):
         close_async_llm_runner()
+        self.llm_logger.disabled = self.logger_was_disabled
         self.context.pop()
 
     def make_model(self, handler, **overrides):
@@ -242,6 +247,25 @@ class OaiLLMModelTests(unittest.TestCase):
         self.assertEqual(payload['temperature'], 0.2)
         self.assertEqual(result, ['line one line two'])
 
+    def test_logs_batch_and_request_metadata_without_content(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                'choices': [{'message': {'content': 'secret translation'}}],
+            })
+
+        model = self.make_model(handler)
+        self.llm_logger.disabled = False
+        with self.assertLogs(self.llm_logger.name, level='INFO') as captured:
+            self.translate(model, ['secret source'])
+        output = '\n'.join(captured.output)
+
+        self.assertIn('LLM batch started', output)
+        self.assertIn('LLM request started', output)
+        self.assertIn('LLM request completed', output)
+        self.assertIn('LLM batch completed', output)
+        self.assertNotIn('secret source', output)
+        self.assertNotIn('secret translation', output)
+
     def test_runner_shutdown_cancels_active_submission(self):
         runner = AsyncLLMRunner()
         started = threading.Event()
@@ -270,9 +294,11 @@ class OaiLLMModelTests(unittest.TestCase):
 
     def test_api_maps_exhausted_backend_failure_to_plain_text_503(self):
         app = create_app()
-        app.logger.disabled = True
         model = configured_models.get_model('EuroLLM-9B-Instruct')
-        with patch.object(model, '_server', 'http://127.0.0.1:9'), patch.object(
+        self.llm_logger.disabled = False
+        with self.assertLogs(app.logger.name, level='INFO') as captured, \
+                self.assertLogs(self.llm_logger.name, level='INFO') as llm_logs, \
+                patch.object(model, '_server', 'http://127.0.0.1:9'), patch.object(
                 model, 'retry_wait_min', 0), patch.object(
                 model, 'retry_wait_max', 0), patch.object(
                 MyAbstractResource, 'log_request'):
@@ -287,3 +313,9 @@ class OaiLLMModelTests(unittest.TestCase):
             response.get_data(as_text=True),
             'The translation backend is temporarily unavailable.',
         )
+        output = '\n'.join(captured.output)
+        self.assertIn('API request started', output)
+        self.assertIn('LLM backend failure status=503', output)
+        self.assertIn('API request completed', output)
+        self.assertIn('status=503', output)
+        self.assertIn('LLM batch failed', '\n'.join(llm_logs.output))

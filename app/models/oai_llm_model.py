@@ -3,13 +3,14 @@ from email.utils import parsedate_to_datetime
 import json
 import logging
 from datetime import datetime, timezone
+import time
 import uuid
 
 import httpx
 import iso639
+from flask import g, has_request_context
 from tenacity import (
     AsyncRetrying,
-    before_sleep_log,
     retry_if_exception_type,
     stop_after_attempt,
 )
@@ -26,6 +27,7 @@ from app.models.llm_errors import (
 
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 RETRYABLE_TRANSPORT_ERRORS = (
     httpx.TimeoutException,
@@ -118,13 +120,63 @@ class OaiLLMModel(models.Model):
 
     def send_sentences_to_backend(self, sentences, src=None, tgt=None,
                                   custom_prompt=None, terms=None):
+        batch_id = str(uuid.uuid4())
+        api_request_id = (
+            getattr(g, 'request_id', 'unknown') if has_request_context()
+            else 'none'
+        )
         prompts = [
             self._format_prompt(sentence, index, src, tgt, custom_prompt, terms)
             for index, sentence in enumerate(sentences)
         ]
         runner = get_async_llm_runner()
         server = self.server
-        return runner.submit(self._translate_prompts(runner, prompts, server))
+        started = time.monotonic()
+        log.info(
+            "LLM batch started api_request_id=%s batch_id=%s model=%s src=%s tgt=%s segments=%s concurrency=%s",
+            api_request_id,
+            batch_id,
+            self.model,
+            src,
+            tgt,
+            len(prompts),
+            self.batch_size,
+        )
+        try:
+            result = runner.submit(
+                self._translate_prompts(runner, prompts, server, batch_id)
+            )
+        except LLMBackendError as error:
+            log.error(
+                "LLM batch failed api_request_id=%s batch_id=%s model=%s segments=%s duration_ms=%.1f error=%s detail=%s",
+                api_request_id,
+                batch_id,
+                self.model,
+                len(prompts),
+                (time.monotonic() - started) * 1000,
+                type(error).__name__,
+                error,
+            )
+            raise
+        except BaseException:
+            log.exception(
+                "LLM batch failed api_request_id=%s batch_id=%s model=%s segments=%s duration_ms=%.1f",
+                api_request_id,
+                batch_id,
+                self.model,
+                len(prompts),
+                (time.monotonic() - started) * 1000,
+            )
+            raise
+        log.info(
+            "LLM batch completed api_request_id=%s batch_id=%s model=%s segments=%s duration_ms=%.1f",
+            api_request_id,
+            batch_id,
+            self.model,
+            len(prompts),
+            (time.monotonic() - started) * 1000,
+        )
+        return result
 
     def _format_prompt(self, sentence, index, src, tgt, custom_prompt, terms):
         sent_terms = None
@@ -148,10 +200,12 @@ class OaiLLMModel(models.Model):
             return self.prompt_terms.format(**values)
         return self.prompt.format(**values)
 
-    async def _translate_prompts(self, runner, prompts, server):
+    async def _translate_prompts(self, runner, prompts, server, batch_id):
         try:
             return await asyncio.wait_for(
-                self._translate_prompts_without_deadline(runner, prompts, server),
+                self._translate_prompts_without_deadline(
+                    runner, prompts, server, batch_id
+                ),
                 timeout=self.overall_timeout,
             )
         except asyncio.TimeoutError as error:
@@ -159,7 +213,8 @@ class OaiLLMModel(models.Model):
                 "The LLM translation batch exceeded its overall deadline"
             ) from error
 
-    async def _translate_prompts_without_deadline(self, runner, prompts, server):
+    async def _translate_prompts_without_deadline(self, runner, prompts, server,
+                                                   batch_id):
         client, semaphore = await runner.model_state(
             self._runtime_key,
             self.batch_size,
@@ -177,7 +232,7 @@ class OaiLLMModel(models.Model):
                 except asyncio.QueueEmpty:
                     return
                 results[index] = await self._translate_prompt(
-                    client, semaphore, prompt, index
+                    client, semaphore, prompt, index, batch_id
                 )
 
         tasks = [asyncio.create_task(worker()) for _ in range(min(
@@ -193,7 +248,8 @@ class OaiLLMModel(models.Model):
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-    async def _translate_prompt(self, client, semaphore, prompt, index):
+    async def _translate_prompt(self, client, semaphore, prompt, index,
+                                batch_id):
         request_id = str(uuid.uuid4())
         retrying = AsyncRetrying(
             retry=retry_if_exception_type(
@@ -204,17 +260,39 @@ class OaiLLMModel(models.Model):
                 minimum=self.retry_wait_min,
                 maximum=self.retry_wait_max,
             ),
-            before_sleep=before_sleep_log(log, logging.WARNING),
+            before_sleep=lambda state: self._log_retry(
+                state, batch_id, request_id, index
+            ),
             reraise=True,
         )
         try:
             async for attempt in retrying:
                 with attempt:
                     async with semaphore:
+                        attempt_number = attempt.retry_state.attempt_number
+                        started = time.monotonic()
+                        log.info(
+                            "LLM request started batch_id=%s request_id=%s model=%s segment=%s attempt=%s",
+                            batch_id,
+                            request_id,
+                            self.model,
+                            index,
+                            attempt_number,
+                        )
                         response = await client.post(
                             "/chat/completions",
                             json=self._request_body(prompt),
                             headers={"X-Request-ID": request_id},
+                        )
+                        log.info(
+                            "LLM request completed batch_id=%s request_id=%s model=%s segment=%s attempt=%s status=%s duration_ms=%.1f",
+                            batch_id,
+                            request_id,
+                            self.model,
+                            index,
+                            attempt_number,
+                            response.status_code,
+                            (time.monotonic() - started) * 1000,
                         )
                         if response.status_code in RETRYABLE_STATUS_CODES:
                             raise RetryableHTTPStatus(response)
@@ -233,6 +311,20 @@ class OaiLLMModel(models.Model):
             raise LLMBackendError(
                 f"LLM backend returned invalid content for segment {index}"
             ) from error
+
+    def _log_retry(self, retry_state, batch_id, request_id, index):
+        exception = retry_state.outcome.exception() if retry_state.outcome else None
+        delay = retry_state.next_action.sleep if retry_state.next_action else 0
+        log.warning(
+            "LLM request retry batch_id=%s request_id=%s model=%s segment=%s attempt=%s delay_seconds=%.1f error=%s",
+            batch_id,
+            request_id,
+            self.model,
+            index,
+            retry_state.attempt_number,
+            delay,
+            type(exception).__name__ if exception else "unknown",
+        )
 
     def _request_body(self, prompt):
         body = {
