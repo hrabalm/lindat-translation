@@ -12,9 +12,9 @@ dependencies = [
     "flask-script",
     "flask-wtf",
     "gunicorn",
+    "httpx",
     "networkx",
     "numpy==1.23.5",
-    "openai",
     # The application uses the `iso639.to_name` API provided by this package.
     "iso639==0.1.4",
     "requests",
@@ -22,6 +22,7 @@ dependencies = [
     "sentence-splitter",
     "tensorflow==2.13.1",
     "tensorflow-serving-api==2.13.1",
+    "tenacity",
     "tensor2tensor",
     "websocket-client",
     "werkzeug",
