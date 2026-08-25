@@ -13,6 +13,8 @@ attributes:
   aria-label:
     ruleTypes: [ATTRIBUTE_TRANS]
 elements:
+  g:
+    ruleTypes: [INLINE]
   meta:
     ruleTypes: [ATTRIBUTES_ONLY]
     translatableAttributes:

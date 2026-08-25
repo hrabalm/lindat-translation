@@ -1,4 +1,21 @@
+import atexit
 import os
+import shutil
+import tempfile
+
+
+def _create_upload_folder(base_dir=None):
+    identity = getattr(os, "getuid", os.getpid)()
+    return tempfile.mkdtemp(
+        prefix=f"lindat-translation-{identity}-",
+        dir=base_dir,
+    )
+
+
+def _cleanup_upload_folder(path, owner_pid):
+    # With Gunicorn preloading, workers inherit the master's atexit handler.
+    if os.getpid() == owner_pid:
+        shutil.rmtree(path, ignore_errors=True)
 
 BOOTSTRAP_SERVE_LOCAL = True
 ERROR_404_HELP = False
@@ -27,7 +44,13 @@ ENCS_LOAD_BALANCED = '10.10.51.71:9000'
 CSEN_LOAD_BALANCED = '10.10.51.72:9000'
 DOCLVL_LOAD_BALANCED = '10.10.51.76:9000'
 
-UPLOAD_FOLDER = '/tmp/translator_uploads'
+_UPLOAD_FOLDER_OWNER_PID = os.getpid()
+UPLOAD_FOLDER = _create_upload_folder()
+atexit.register(
+    _cleanup_upload_folder,
+    UPLOAD_FOLDER,
+    _UPLOAD_FOLDER_OWNER_PID,
+)
 
 # These should match with the appropriate constants in the frontend
 # inxml, innopxml are our custom XML formats for ČTK that treasts all tags/all tags except <p> as inline tags
@@ -35,3 +58,9 @@ ALLOWED_EXTENSIONS = {'inxml', 'innopxml', 'txt', 'xml', 'html', 'htm', 'docx', 
 
 TIKAL_PATH = os.environ.get('TIKAL_PATH', '/home/jon/okapi-apps/')
 MODEL_SERVER = os.environ.get('MODEL_SERVER')
+FRAUS_V2_FORCE_SENTENCE_LEVEL = os.environ.get(
+    'FRAUS_V2_FORCE_SENTENCE_LEVEL', 'true'
+).lower() in {'1', 'true', 'yes'}
+FRAUS_V2_MAX_SEGMENT_TOKENS = int(
+    os.environ.get('FRAUS_V2_MAX_SEGMENT_TOKENS', '100')
+)
