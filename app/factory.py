@@ -82,8 +82,11 @@ def create_app():
 
     @app.before_request
     def log_request_start():
+        from app.models.llm_request_state import initialize_request_llm_state
+
         g.request_log_start = time.monotonic()
         g.request_id = request.headers.get('X-Request-ID') or str(uuid.uuid4())
+        initialize_request_llm_state()
         app.logger.info(
             "API request started request_id=%s method=%s path=%s content_length=%s remote=%s",
             g.request_id,
@@ -95,20 +98,38 @@ def create_app():
 
     @app.after_request
     def log_request_end(response):
+        from app.models.llm_request_state import get_request_llm_state
+
         started = getattr(g, 'request_log_start', None)
         duration_ms = (
             (time.monotonic() - started) * 1000 if started is not None else -1
         )
         request_id = getattr(g, 'request_id', 'unknown')
+        llm_state = get_request_llm_state()
+        partial = bool(llm_state and llm_state.partial and response.status_code < 400)
         app.logger.info(
-            "API request completed request_id=%s method=%s path=%s status=%s duration_ms=%.1f",
+            "API request completed request_id=%s method=%s path=%s status=%s duration_ms=%.1f llm_partial=%s llm_segments=%s llm_fallbacks=%s",
             request_id,
             request.method,
             request.path,
             response.status_code,
             duration_ms,
+            partial,
+            llm_state.total_segments if llm_state else 0,
+            llm_state.fallback_segments if llm_state else 0,
         )
         response.headers.setdefault('X-Request-ID', request_id)
+        if partial:
+            response.headers['X-Translation-Partial'] = 'true'
+            response.headers['X-Translation-Source-Fallback-Segments'] = str(
+                llm_state.fallback_segments
+            )
+            response.headers['X-Translation-Total-Segments'] = str(
+                llm_state.total_segments
+            )
+            response.headers['X-Translation-Fallback-Token-Ratio'] = (
+                f'{llm_state.fallback_token_ratio:.3f}'
+            )
         return response
 
     return app

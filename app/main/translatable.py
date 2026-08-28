@@ -23,3 +23,12 @@ class Translatable:
             'X-Billing-Output-Word-Count': self._output_word_count,
             'X-Billing-Input-NFC-Len': self._input_nfc_len,
         }
+
+    @staticmethod
+    def finalize_llm_translation():
+        from app.models.llm_request_state import get_request_llm_state
+
+        state = get_request_llm_state()
+        if (state is not None and state.total_segments
+                and not state.successful_segments):
+            raise state.representative_error()

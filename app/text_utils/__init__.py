@@ -32,8 +32,13 @@ def extract_text(translation):
             text_arr = []
     else:
         text_arr = []
-    return ' '.join(text_arr).replace('\n ', '\n')
+    result = ''
+    for value in text_arr:
+        if (result and value and not result[-1].isspace()
+                and not value[0].isspace()):
+            result += ' '
+        result += value
+    return result.replace('\n ', '\n')
 
 def count_words(translation):
     return len(extract_text(translation).split())
-

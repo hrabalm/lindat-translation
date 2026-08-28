@@ -5,6 +5,7 @@ from flask_restx import Namespace, Resource, fields
 from app.main.api.translation.endpoints.MyAbstractResource import MyAbstractResource
 from app.main.api.translation.parsers import text_input_with_src_tgt
 from app.model_settings import models
+from app.models.oai_llm_model import OaiLLMModel
 
 from app.main.api_examples.model_resource_example import *
 from app.main.api_examples.models_resource_example import *
@@ -124,7 +125,12 @@ class ModelItem(MyAbstractResource):
         src_default = list(model.supports.keys())[0]
         src = args.get('src', src_default) or src_default
         prompt = args.get('prompt', None)
-        split = args.get('split-newlines', None)
+        split_arg = args.get('split-newlines')
+        split = (
+            isinstance(model, OaiLLMModel)
+            if split_arg is None
+            else split_arg
+        )
         terms= args.get('terms', None)
         log.error('terms: {}'.format(terms))
         terms = json.loads(terms) if terms else None

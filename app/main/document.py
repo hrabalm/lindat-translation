@@ -858,8 +858,14 @@ class InnerLindatTranslator(Translator):
             tgt_sentences[0] = "\n" * num_prefix_newlines + tgt_sentences[0]
             src_sentences[-1] = src_sentences[-1].rstrip("\n") + "\n" * num_suffix_newlines
             tgt_sentences[-1] = tgt_sentences[-1].rstrip("\n") + "\n" * num_suffix_newlines
-            src_sentences = [s + " " if not s.endswith("\n") else s for s in src_sentences]
-            tgt_sentences = [s + " " if not s.endswith("\n") else s for s in tgt_sentences]
+            src_sentences = [
+                s + " " if s and not s[-1].isspace() else s
+                for s in src_sentences
+            ]
+            tgt_sentences = [
+                s + " " if s and not s[-1].isspace() else s
+                for s in tgt_sentences
+            ]
         return src_sentences, tgt_sentences
 
 
@@ -902,6 +908,7 @@ class Document(Translatable):
         self._fallback_diagnostics = []
         try:
             self._extract_translate_merge(src, tgt, "from_to", None, custom_prompt, terms, split)
+            self.finalize_llm_translation()
         except Exception:
             self._cleanup_work_dir()
             raise
@@ -910,6 +917,7 @@ class Document(Translatable):
         self._fallback_diagnostics = []
         try:
             self._extract_translate_merge(src, tgt, "with_model", model, custom_prompt, terms, split)
+            self.finalize_llm_translation()
         except Exception:
             self._cleanup_work_dir()
             raise
@@ -931,6 +939,11 @@ class Document(Translatable):
         return f"{orig_root}.{tgt}{file_extension}"
 
     def _extract_translate_merge_fraus(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
+        from app.models.llm_request_state import (
+            llm_state_checkpoint,
+            rollback_llm_state,
+        )
+
         app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         args = text_input_with_src_tgt.parse_args(request)
         transform_name = args.get('xmlTransform')
@@ -963,6 +976,7 @@ class Document(Translatable):
         if self.xml_transform is not None:
             with open(self.orig_full_path, "rb") as source_file:
                 source_bytes = source_file.read()
+        checkpoint = llm_state_checkpoint()
         try:
             self._run_document_pipeline(
                 document_format, src, tgt, method, model, custom_prompt, terms, split
@@ -974,6 +988,7 @@ class Document(Translatable):
                   and "paired tag" in str(error).lower())
             if source_bytes is None or not retryable:
                 raise
+            rollback_llm_state(checkpoint)
             self._fallback_diagnostics.append({
                 "type": "document_pipeline_fallback",
                 "strategy": "legacy_fraus",
@@ -1027,6 +1042,14 @@ class Document(Translatable):
             self.debug_trace["llm_segments"] = self.debug_segments
         if debug and self._fallback_diagnostics:
             self.debug_trace["fallbacks"] = copy.deepcopy(self._fallback_diagnostics)
+        if debug:
+            from app.models.llm_request_state import get_request_llm_state
+
+            llm_state = get_request_llm_state()
+            if llm_state is not None and llm_state.fallback_segments:
+                self.debug_trace["llm_fallbacks"] = copy.deepcopy(
+                    llm_state.fallback_diagnostics()
+                )
 
     def _extract_translate_merge_pdf(self, src, tgt, method, model=None, custom_prompt=None, terms=None, split=True):
         self.pdf_editor = PdfEditor(self.orig_full_path)
@@ -1050,6 +1073,12 @@ class Document(Translatable):
         self.debug_segments = []
 
         def translate_markup(text):
+            from app.models.llm_request_state import (
+                llm_state_checkpoint,
+                rollback_llm_state,
+            )
+
+            checkpoint = llm_state_checkpoint()
             translator = InnerLindatTranslator(
                 method, src, tgt, model, custom_prompt=custom_prompt,
                 terms=terms, split=split,
@@ -1057,8 +1086,12 @@ class Document(Translatable):
             mt = MarkupTranslator(
                 translator, LindatAligner(src, tgt, show_progress=False), RegexTokenizer()
             )
-            result = mt.translate(text)
-            result = sanitize_generated_markup(text, result)
+            try:
+                result = mt.translate(text)
+                result = sanitize_generated_markup(text, result)
+            except Exception:
+                rollback_llm_state(checkpoint)
+                raise
             self.debug_segments.extend(translator.debug_segments)
             return result
 

@@ -16,3 +16,7 @@ class LLMBackendTimeout(LLMBackendError):
 class LLMBackendRejected(LLMBackendError):
     status_code = 422
     public_message = "The translation backend rejected the input."
+
+
+class LLMCompletionTruncated(LLMBackendError):
+    pass

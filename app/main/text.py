@@ -30,10 +30,12 @@ class Text(Translatable):
 
     def translate_from_to(self, src, tgt, custom_prompt=None, terms=None, split=True):
         self.translation = translate_from_to(src, tgt, self.text, custom_prompt=custom_prompt, terms=terms, split=split)
+        self.finalize_llm_translation()
         self._output_word_count = count_words(self.translation)
     
     def translate_with_model(self, model, src, tgt, custom_prompt=None, terms=None, split=True):
         self.translation = translate_with_model(model, self.text, src, tgt, custom_prompt=custom_prompt, terms=terms, split=split)
+        self.finalize_llm_translation()
         self._output_word_count = count_words(self.translation)
 
     def get_text(self):

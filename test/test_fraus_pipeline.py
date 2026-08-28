@@ -31,6 +31,11 @@ from app.main.document import (
     wrap_paragraph,
 )
 from app.main.api.translation.parsers import text_input_with_src_tgt
+from app.models.llm_errors import LLMBackendUnavailable
+from app.models.llm_request_state import (
+    LLMSegmentRecord,
+    get_request_llm_state,
+)
 
 
 class FrausTransformTests(unittest.TestCase):
@@ -475,11 +480,25 @@ class PipelineTests(unittest.TestCase):
 
         with app.test_request_context('/?debug=true'), patch.object(
                 DocumentPipeline, 'run', return_value=result):
+            get_request_llm_state().add([LLMSegmentRecord(
+                segment='0',
+                estimated_tokens=2,
+                translated=False,
+                error=LLMBackendUnavailable('unavailable'),
+            )])
             document._run_document_pipeline(
                 document_format, 'cs', 'uk', 'from_to', None, None, None, True
             )
             self.assertEqual(document.debug_trace['fallbacks'],
                              document._fallback_diagnostics)
+            self.assertEqual(document.debug_trace['llm_fallbacks'], [{
+                'segment': '0',
+                'estimated_tokens': 2,
+                'strategy': 'original_source',
+                'resplit_depth': 0,
+                'error': 'LLMBackendUnavailable',
+                'status': 503,
+            }])
 
         with app.test_request_context('/'), patch.object(
                 DocumentPipeline, 'run', return_value=result):
