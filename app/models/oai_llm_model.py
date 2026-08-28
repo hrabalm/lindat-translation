@@ -133,11 +133,6 @@ class OaiLLMModel(models.Model):
         self.max_resplit_depth = cfg.get('max_resplit_depth', 3)
         if self.max_resplit_depth < 0:
             raise ValueError("max_resplit_depth must not be negative")
-        if (self.max_completion_tokens is not None
-                and self.max_input_tokens >= self.max_completion_tokens):
-            raise ValueError(
-                "max_input_tokens must be smaller than max_completion_tokens"
-            )
         self._runtime_key = object()
 
     @property

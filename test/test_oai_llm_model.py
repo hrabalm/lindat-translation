@@ -469,20 +469,20 @@ class OaiLLMModelTests(unittest.TestCase):
         self.assertEqual(model.max_completion_tokens, 512)
         self.assertEqual(model.batch_size, 256)
 
-    def test_input_limit_must_be_smaller_than_completion_limit(self):
+    def test_input_and_completion_limits_are_independent(self):
         async def handler(request):
             return httpx.Response(200, json={
                 'choices': [{'message': {'content': 'unused'}}],
             })
 
-        with self.assertRaisesRegex(
-                ValueError,
-                'max_input_tokens must be smaller than max_completion_tokens'):
-            self.make_model(
-                handler,
-                max_input_tokens=512,
-                max_completion_tokens=512,
-            )
+        model = self.make_model(
+            handler,
+            max_input_tokens=256,
+            max_completion_tokens=256,
+        )
+
+        self.assertEqual(model.max_input_tokens, 256)
+        self.assertEqual(model.max_completion_tokens, 256)
 
     def test_logs_batch_and_request_metadata_without_content(self):
         async def handler(request):
