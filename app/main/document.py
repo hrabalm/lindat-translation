@@ -19,6 +19,7 @@ from app.main.api.restplus import api
 from app.main.api.translation.parsers import text_input_with_src_tgt
 from app.main.translate import translate_from_to, translate_with_model
 from app.main.translatable import Translatable
+from app.models.llm_errors import LLMBackendError
 from app.settings import (
     ALLOWED_EXTENSIONS,
     FRAUS_V2_FORCE_SENTENCE_LEVEL,
@@ -103,6 +104,10 @@ class TikalError(RuntimeError):
     pass
 
 
+class FrausTranslationError(LLMBackendError):
+    pass
+
+
 def translate_with_line_fallback(text, translate, on_fallback=None):
     try:
         return translate(text)
@@ -127,6 +132,7 @@ class FrausV2XmlTransform(XmlTransform):
     text_tag = f"{{{namespace}}}text"
     option_tag = f"{{{namespace}}}option"
     synthetic_prefix = "fraus-v2-"
+    context_placeholders = ("__BLANK__", "__PLACEHOLDER__")
 
     def __init__(self, force_sentence_level=False, max_segment_tokens=None,
                  language="cs"):
@@ -137,8 +143,11 @@ class FrausV2XmlTransform(XmlTransform):
         self.language = language
         self.variant_records = {}
         self.variant_sequence = []
+        self.variant_marker_kinds = []
+        self.variant_source_payloads = []
         self.fallback_values = {}
         self.fallback_diagnostics = []
+        self.translated_units = {}
 
     def _split_text(self, text):
         if not self.force_sentence_level and not self.max_segment_tokens:
@@ -173,8 +182,11 @@ class FrausV2XmlTransform(XmlTransform):
         root = copy.deepcopy(self.original_root)
         self.variant_records = {}
         self.variant_sequence = []
+        self.variant_marker_kinds = []
+        self.variant_source_payloads = []
         self.fallback_values = {}
         self.fallback_diagnostics = []
+        self.translated_units = {}
 
         for ra in list(root.iter("RA")):
             if not any(ancestor.tag == "Questions" for ancestor in self._ancestors(root, ra)):
@@ -209,9 +221,11 @@ class FrausV2XmlTransform(XmlTransform):
                 variant_ra = copy.deepcopy(ra)
                 variant_ra.set(f"{{{self.namespace}}}source-ra", str(id(ra)))
                 variant_ra.set(f"{{{self.namespace}}}variant", str(variant))
-                self.variant_sequence.append(
-                    self._flatten_context(variant_ra, variant)
+                selected_keys, marker_kinds = self._flatten_context(
+                    variant_ra, variant
                 )
+                self.variant_sequence.append(selected_keys)
+                self.variant_marker_kinds.append(marker_kinds)
                 owner.insert(insert_at + variant, variant_ra)
 
         ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
@@ -294,6 +308,7 @@ class FrausV2XmlTransform(XmlTransform):
     def _flatten_context(self, ra, variant):
         pieces = []
         selected_keys = []
+        marker_kinds = []
         children = list(ra)
         text_index = 0
         option_index = 0
@@ -325,6 +340,7 @@ class FrausV2XmlTransform(XmlTransform):
                         piece = ("text", piece[1], " " + text)
                 if index and pieces[index - 1][0] == "text":
                     last = ET.SubElement(payload, "g", {"id": f"fraus-text-{piece[1]}"})
+                    marker_kinds.append("text")
                     last.text = piece[2]
                 elif last is None:
                     payload.text = (payload.text or "") + piece[2]
@@ -332,25 +348,45 @@ class FrausV2XmlTransform(XmlTransform):
                     last.tail = (last.tail or "") + piece[2]
             else:
                 last = ET.SubElement(payload, "g", {"id": f"fraus-option-{piece[1]}"})
+                marker_kinds.append("option")
                 last.text = piece[2]
         ra.insert(0, payload)
-        return selected_keys
+        serialized = ET.tostring(payload, encoding="unicode")
+        self.variant_source_payloads.append(html.unescape(
+            serialized[serialized.index(">") + 1:serialized.rindex("</ExText>")]))
+        return selected_keys, marker_kinds
 
     def _restore_ra(self, translated_ra, variants, record):
         restored = copy.deepcopy(record["original"])
         for attr in (f"{{{self.namespace}}}source-ra", f"{{{self.namespace}}}variant"):
             restored.attrib.pop(attr, None)
-        payload = translated_ra.find("ExText")
+        payload = record.get("recovered_context")
+        if payload is None:
+            payload = translated_ra.find("ExText")
         runs = []
-        if payload is not None:
-            if payload.text:
-                runs.append(payload.text)
-            for marker in payload:
-                marker_id = marker.get("id", "")
-                if marker_id.startswith("fraus-text-"):
-                    runs.append("".join(marker.itertext()))
-                if marker.tail:
-                    runs.append(marker.tail)
+        previous = None
+        text_index = option_index = 0
+        for child in restored:
+            if child.tag == "ExText":
+                if previous == "text":
+                    marker = (payload.find(f'./g[@id="fraus-text-{text_index}"]')
+                              if payload is not None else None)
+                    value = "".join(marker.itertext()) if marker is not None else None
+                elif previous == "option":
+                    marker = (payload.find(f'./g[@id="{last_option_id}"]')
+                              if payload is not None else None)
+                    value = marker.tail if marker is not None else None
+                else:
+                    value = payload.text if payload is not None else None
+                runs.append(value)
+                text_index += 1
+                previous = "text"
+            elif child.tag == "InputOption":
+                selects = child.findall("SelectOption")
+                select_index = selects.index(self._selected(selects, 0))
+                last_option_id = f"fraus-option-{record['source_id']}-{option_index}-{select_index}"
+                option_index += 1
+                previous = "option"
         option_values = {}
         for variant in variants:
             number = int(variant.get(f"{{{self.namespace}}}variant", "0"))
@@ -370,8 +406,14 @@ class FrausV2XmlTransform(XmlTransform):
                             option_values[number][marker_id[len("fraus-option-"):]] = "".join(marker.itertext())
         selected_values = {}
         for values in option_values.values():
-            selected_values.update(values)
+            for key, value in values.items():
+                selected_values.setdefault(key, value)
         selected_values.update(self.fallback_values)
+        translated_other = [child for child in translated_ra if child.tag != "ExText"]
+        original_other = [child for child in restored if child.tag not in ("ExText", "InputOption")]
+        if [child.tag for child in translated_other] != [child.tag for child in original_other]:
+            raise FrausTranslationError("FRAUS non-option children changed during reconstruction")
+        other_children = iter(translated_other)
         new_children = []
         run_index = 0
         option_index = 0
@@ -380,6 +422,8 @@ class FrausV2XmlTransform(XmlTransform):
                 value = runs[run_index] if run_index < len(runs) else None
                 if value is not None and (value.strip() or not (child.text or "").strip()):
                     child.text = value
+                elif (child.text or "").strip():
+                    raise FrausTranslationError("FRAUS context reconstruction has no usable translation")
                 new_children.append(child)
                 run_index += 1
             elif child.tag == "InputOption":
@@ -389,10 +433,12 @@ class FrausV2XmlTransform(XmlTransform):
                     value = selected_values.get(option_key)
                     if option_text is not None and value and value.strip():
                         option_text.text = value
+                    elif option_text is not None and (option_text.text or "").strip():
+                        raise FrausTranslationError("FRAUS option reconstruction has no usable translation")
                 new_children.append(child)
                 option_index += 1
             else:
-                new_children.append(child)
+                new_children.append(copy.deepcopy(next(other_children)))
         for position, child in enumerate(new_children):
             child.set("Position", str(position))
         restored[:] = new_children
@@ -401,165 +447,552 @@ class FrausV2XmlTransform(XmlTransform):
     def fallback(self, source_text, translated_text, translate_one):
         source_lines = source_text.splitlines(keepends=True)
         target_lines = translated_text.splitlines(keepends=True)
-        source_variant_indices = [index for index, line in enumerate(source_lines)
-                                  if "<g" in line]
-        target_variant_indices = [index for index, line in enumerate(target_lines)
-                                  if "<g" in line]
+        context_translations = {}
+        source_variant_indices = self._variant_line_indices(source_lines)
+        variant_indices = list(range(len(self.variant_sequence)))
+        if self.variant_source_payloads and self.variant_records:
+            mapping = self._map_source_variants(source_lines)
+            source_variant_indices = [line_index for line_index, _, _ in mapping]
+            variant_indices = [variant_index for _, variant_index, _ in mapping]
         source_variants = [source_lines[index] for index in source_variant_indices]
-        target_variants = [target_lines[index] for index in target_variant_indices]
-        if not source_variants:
+        same_line_count = len(source_lines) == len(target_lines)
+        if not self.variant_sequence:
             return translated_text
+        if not source_variants and not self.variant_marker_kinds:
+            return translated_text
+        if len(source_variants) != len(variant_indices):
+            raise AssertionError("FRAUS variant structure is ambiguous during recovery")
+        if not same_line_count:
+            raise AssertionError("FRAUS line structure changed during recovery")
+        target_variant_indices = self._variant_line_indices(target_lines)
+        if (len(target_variant_indices) == len(source_variant_indices)
+                and target_variant_indices != source_variant_indices):
+            raise AssertionError("FRAUS variant line positions changed during recovery")
+        target_variants = [target_lines[index] for index in source_variant_indices]
+        recovered_lines = list(target_lines)
 
-        unsafe_indices = set()
-        unsafe_reasons = {}
-        if len(source_variants) == len(target_variants):
-            pairs = zip(source_variants, target_variants)
-            for index, (source_line, target_line) in enumerate(pairs):
-                try:
-                    source_fragment = ET.fromstring(f"<root>{source_line.strip()}</root>")
-                    fragment = ET.fromstring(f"<root>{target_line.strip()}</root>")
-                    source_markers = list(source_fragment.iter("g"))
-                    markers = list(fragment.iter("g"))
-                    reasons = []
-                    if ([marker.get("id") for marker in markers]
-                            != [marker.get("id") for marker in source_markers]):
-                        reasons.append("marker_identity")
-                    if any(
-                            [child.tag for child in marker.iter() if child is not marker]
-                            != [child.tag for child in source_marker.iter()
-                                 if child is not source_marker]
-                            for source_marker, marker in zip(source_markers, markers)):
-                        reasons.append("marker_structure")
-                    if any(not "".join(marker.itertext()).strip() for marker in markers):
-                        reasons.append("empty_marker")
-                    if reasons:
-                        unsafe_indices.add(index)
-                        unsafe_reasons[index] = reasons
-                except ET.ParseError:
-                    unsafe_indices.add(index)
-                    unsafe_reasons[index] = ["invalid_markup"]
-        else:
-            # Newlines are not stable translation boundaries. Retry every
-            # variant when the first pass changes their count.
-            unsafe_indices.update(range(len(source_variants)))
-            unsafe_reasons.update(
-                (index, ["variant_line_count"])
-                for index in range(len(source_variants))
-            )
-
-        for variant_index in sorted(unsafe_indices):
-            if variant_index >= len(self.variant_sequence):
+        correct_indices = {}
+        offset = 0
+        for record in self.variant_records.values():
+            for index in range(offset, offset + record["variants"]):
+                correct_indices[index] = offset
+            offset += record["variants"]
+        accepted_contexts = {}
+        contextual_values = {}
+        for line_index, index, source_line, target_line in zip(
+                source_variant_indices, variant_indices, source_variants, target_variants):
+            try:
+                source_root = self._parse_fragment(source_line)
+            except ET.ParseError:
                 continue
-            self.fallback_diagnostics.append({
-                "type": "unsafe_context_variant",
-                "variant_index": variant_index,
-                "reasons": unsafe_reasons.get(variant_index, ["unknown"]),
-                "action": "restore_source_context",
-            })
-            source_line = source_variants[variant_index]
-            select_ids = self.variant_sequence[variant_index]
-            source_root = ET.fromstring(f"<root>{source_line.strip()}</root>")
-            all_source_markers = list(source_root.iter("g"))
-            option_markers = [
-                marker for marker in all_source_markers
-                if marker.get("id", "").startswith("fraus-option-")
-            ]
-            source_markers = option_markers or all_source_markers
-            if len(source_markers) != len(select_ids):
-                for select_id in select_ids:
-                    self.fallback_values[select_id] = None
-                    self.fallback_diagnostics.append({
-                        "type": "option_retry",
-                        "variant_index": variant_index,
-                        "option_key": select_id,
-                        "strategy": "original",
-                        "reason": "source_marker_count",
-                    })
-                continue
-            for marker_index, select_id in enumerate(select_ids):
-                source_marker = source_markers[marker_index]
-                source_value = "".join(source_marker.itertext()).strip()
-                retry_source = self._keep_one_marker(
-                    source_line, all_source_markers.index(source_marker)
-                )
-                accepted_value = None
-                strategy = "original"
-                try:
-                    retry_target = translate_one(retry_source)
-                    retry_root = ET.fromstring(f"<root>{retry_target.strip()}</root>")
-                    retry_markers = list(retry_root.iter("g"))
-                    if len(retry_markers) == 1 and not any(
-                            child.tag == "g" for child in retry_markers[0].iter()
-                            if child is not retry_markers[0]) and (
-                            [child.tag for child in retry_markers[0].iter()
-                             if child is not retry_markers[0]]
-                            == [child.tag for child in source_marker.iter()
-                                if child is not source_marker]):
-                        value = "".join(retry_markers[0].itertext()).strip()
-                        if self._safe_option_value(source_value, value):
-                            accepted_value = value
-                            strategy = "contextual"
-                except (ET.ParseError, AssertionError, ValueError):
-                    pass
-                if accepted_value is None:
+            target_options = {}
+            scopes = self.translated_units.get(line_index, [(source_line, target_line)])
+            for source_unit, target_unit in scopes:
+                unit_ids = {m.get("id") for m in self._parse_fragment(source_unit).iter("g")}
+                candidates = ([target_unit] if line_index in self.translated_units
+                              else self._sentence_fragments(target_unit))
+                for sentence in candidates:
                     try:
-                        standalone = self._standalone_value(translate_one(source_value + "\n"))
-                        if self._safe_option_value(source_value, standalone):
-                            accepted_value = standalone
-                            strategy = "standalone"
-                    except (AssertionError, ValueError):
-                        pass
-                # None tells restoration to retain the original option text.
-                self.fallback_values[select_id] = accepted_value
+                        target_root = self._parse_fragment(sentence)
+                    except ET.ParseError:
+                        continue
+                    for marker in target_root.iter("g"):
+                        if marker.get("id") in unit_ids:
+                            target_options.setdefault(marker.get("id"), []).append(marker)
+            markers = list(source_root.iter("g"))
+            kinds = (self.variant_marker_kinds[index] if self.variant_marker_kinds else [
+                "option" if m.get("id", "").startswith("fraus-option-") else "text"
+                for m in markers])
+            options = [m for m, kind in zip(markers, kinds) if kind == "option"]
+            for source_marker, key in zip(options, self.variant_sequence[index]):
+                matches = target_options.get(source_marker.get("id"), [])
+                if len(matches) == 1 and self._shape(matches[0]) == self._shape(source_marker):
+                    value = "".join(matches[0].itertext()).strip()
+                    if value:
+                        contextual_values.setdefault(key, value)
+        pending = set(range(len(self.variant_sequence))) - set(variant_indices)
+        offset = 0
+        for record in self.variant_records.values():
+            record_indices = set(range(offset, offset + record["variants"]))
+            offset += record["variants"]
+            if not pending & record_indices:
+                continue
+            pending.update(record_indices)
+            self._recover_unmapped_ra(record, translate_one, contextual_values, context_translations)
+        for line_index, variant_index, source_line, target_line in zip(
+                source_variant_indices, variant_indices, source_variants, target_variants):
+            if variant_index in pending:
+                continue
+            source_root = self._parse_fragment(source_line.rstrip("\r\n"))
+            source_markers = list(source_root.iter("g"))
+            kinds = (self.variant_marker_kinds[variant_index]
+                     if self.variant_marker_kinds else [
+                         "option" if marker.get("id", "").startswith("fraus-option-")
+                         else "text" for marker in source_markers])
+            option_markers = [marker for marker, kind in zip(source_markers, kinds)
+                              if kind == "option"]
+            select_ids = self.variant_sequence[variant_index]
+            if len(option_markers) != len(select_ids):
+                raise AssertionError("FRAUS option marker count changed during recovery")
+            if not self.variant_marker_kinds and [m.get("id") for m in option_markers] != [
+                    f"fraus-option-{key}" for key in select_ids]:
+                raise AssertionError("FRAUS option marker identity changed during recovery")
+            try:
+                target_root = self._parse_fragment(target_line.rstrip("\r\n"))
+            except ET.ParseError:
+                target_root = ET.Element("root")
+            option_ids = {marker.get("id") for marker in option_markers}
+            context_valid = self._context_valid(source_root, target_root, option_ids)
+            owned_units = self.translated_units.get(line_index)
+            if owned_units is not None:
+                for source_unit, target_unit in owned_units:
+                    try:
+                        unit_valid = self._context_valid(
+                            self._parse_fragment(source_unit), self._parse_fragment(target_unit), option_ids)
+                    except ET.ParseError:
+                        unit_valid = False
+                    context_valid = context_valid and unit_valid
+            values = {}
+            for source_marker, select_id in zip(option_markers, select_ids):
+                value = contextual_values.get(select_id)
+                source_value = "".join(source_marker.itertext()).strip()
+                if not value and source_value:
+                    value = self.fallback_values.get(select_id)
+                    if value is None:
+                        value = self._standalone_value(translate_one(
+                            html.escape(source_value, quote=False) + "\n"))
+                        if not value:
+                            raise FrausTranslationError("FRAUS option recovery produced no usable translation")
+                        self.fallback_diagnostics.append({
+                            "type": "option_retry", "variant_index": variant_index,
+                            "option_key": select_id, "strategy": "standalone",
+                        })
+                values[source_marker.get("id")] = value or ""
+                self.fallback_values.setdefault(select_id, value or "")
+
+            correct_index = correct_indices.get(variant_index, variant_index)
+            if not context_valid:
                 self.fallback_diagnostics.append({
-                    "type": "option_retry",
-                    "variant_index": variant_index,
-                    "option_key": select_id,
-                    "strategy": strategy,
+                    "type": "unsafe_context_variant", "variant_index": variant_index,
+                    "action": "recover_sentence_context" if correct_index == variant_index
+                    else "reuse_correct_context",
                 })
-        if len(source_variants) != len(target_variants):
-            return source_text
-        for variant_index in unsafe_indices:
-            target_lines[target_variant_indices[variant_index]] = source_variants[variant_index]
-        return "".join(target_lines)
+                if correct_index in accepted_contexts:
+                    target_root = copy.deepcopy(accepted_contexts[correct_index])
+                    for marker, source_marker in zip(target_root.iter("g"), source_markers):
+                        marker.attrib = dict(source_marker.attrib)
+                else:
+                    if owned_units is not None:
+                        source_sentences = [source for source, _ in owned_units]
+                        target_sentences = [target for _, target in owned_units]
+                    else:
+                        source_sentences = self._sentence_fragments(source_line)
+                        target_sentences = self._sentence_fragments(target_line)
+                        if (len(source_sentences) != len(target_sentences)
+                                or any(not list(self._parse_fragment(sentence).iter("g"))
+                                       for sentence in source_sentences)):
+                            source_sentences, target_sentences = [source_line], [""]
+                        else:
+                            for sentence, candidate in zip(source_sentences, target_sentences):
+                                expected_ids = {m.get("id") for m in self._parse_fragment(sentence).iter("g")}
+                                try:
+                                    actual_ids = {m.get("id") for m in self._parse_fragment(candidate).iter("g")}
+                                except ET.ParseError:
+                                    continue
+                                if not actual_ids <= expected_ids:
+                                    source_sentences, target_sentences = [source_line], [""]
+                                    break
+                    recovered_parts = []
+                    for index, sentence in enumerate(source_sentences):
+                        candidate = (target_sentences[index]
+                                     if len(source_sentences) == len(target_sentences) else "")
+                        try:
+                            valid = self._context_valid(
+                                self._parse_fragment(sentence), self._parse_fragment(candidate),
+                                option_ids)
+                        except ET.ParseError:
+                            valid = False
+                        recovered_parts.append(candidate if valid else self._recover_context(
+                            sentence, translate_one, context_translations,
+                            variant_index, option_ids))
+                    recovered = "".join(recovered_parts)
+                    target_root = self._parse_fragment(recovered.rstrip("\r\n"))
+            for marker in target_root.iter("g"):
+                if marker.get("id") in values:
+                    marker[:] = []
+                    marker.text = values[marker.get("id")]
+            if correct_index == variant_index:
+                accepted_contexts[variant_index] = copy.deepcopy(target_root)
+            recovered = ET.tostring(target_root, encoding="unicode")
+            recovered_lines[line_index] = self._preserve_line_ending(
+                source_line, recovered[len("<root>"):-len("</root>")])
+        return "".join(recovered_lines)
+
+    def _recover_unmapped_ra(self, record, translate_one, contextual_values, translations):
+        # Extraction ownership is uncertain, but the original RA's XML positions
+        # are not. Recover there without changing any unidentified output lines.
+        source = copy.deepcopy(record["original"])
+        for node in source.iter("ExText"):
+            node.text = _TAG_TOKEN_RE.sub("", html.unescape(node.text or ""))
+        source.set(f"{{{self.namespace}}}source-ra", record["source_id"])
+        temporary = FrausV2XmlTransform()
+        temporary._flatten_context(source, 0)
+        payload = source.find("ExText")
+        source_line = html.escape(payload.text or "", quote=False) + "".join(
+            ET.tostring(child, encoding="unicode") for child in payload)
+        option_ids = {marker.get("id") for marker in payload.iter("g")
+                      if marker.get("id", "").startswith("fraus-option-")}
+        self.fallback_diagnostics.append({
+            "type": "ambiguous_ra_recovery", "source_id": record["source_id"],
+            "strategy": "original_xml_boundaries",
+        })
+        recovered = self._recover_context(source_line, translate_one, translations, None, option_ids)
+        record["recovered_context"] = self._parse_fragment(recovered)
+        for option_index, option in enumerate(record["original"].findall("InputOption")):
+            for select_index, select in enumerate(option.findall("SelectOption")):
+                key = f"{record['source_id']}-{option_index}-{select_index}"
+                value = contextual_values.get(key)
+                if value is None:
+                    source_value = _TAG_TOKEN_RE.sub("", html.unescape(select.findtext("ExText") or ""))
+                    value = (self._standalone_value(translate_one(
+                        html.escape(source_value, quote=False) + "\n")) if source_value.strip() else source_value)
+                    if source_value.strip() and not value:
+                        raise FrausTranslationError("FRAUS option recovery produced no usable translation")
+                self.fallback_values[key] = value
 
     @staticmethod
-    def _safe_option_value(source_value, target_value):
-        if not target_value or not target_value.strip():
+    def _shape(node):
+        return (node.tag, node.get("id"), tuple(FrausV2XmlTransform._shape(child) for child in node))
+
+    def _context_valid(self, source, target, option_ids):
+        if self._shape(source) != self._shape(target):
             return False
-        source_words = max(1, len(source_value.split()))
-        return len(target_value.split()) <= source_words * 5 + 4
+        for source_node, target_node in zip(source.iter(), target.iter()):
+            if source_node.get("id") not in option_ids:
+                if (source_node.text or "").strip() and not (target_node.text or "").strip():
+                    return False
+            if (source_node.tail or "").strip() and not (target_node.tail or "").strip():
+                return False
+        return True
+
+    def _sentence_fragments(self, line):
+        """Split only at sentence boundaries outside paired spans."""
+        def match_offsets(text, sentence, cursor):
+            # The splitter can collapse whitespace; match against the original
+            # text so both offsets include the actual whitespace widths.
+            pattern = r"\s*(" + r"\s+".join(
+                re.escape(word) for word in sentence.split()) + ")"
+            match = re.compile(pattern).match(text, cursor)
+            return match.span(1) if match else None
+
+        try:
+            root = self._parse_fragment(line)
+        except ET.ParseError:
+            # A malformed later sentence need not invalidate an independently
+            # parseable earlier one. Never try to repair the malformed markup.
+            sentences = split_text_into_sentences(line.strip(), self.language)
+            fragments = []
+            cursor = 0
+            for sentence in sentences:
+                offsets = match_offsets(line, sentence, cursor)
+                if offsets is None:
+                    return [line]
+                start, end = offsets
+                if fragments:
+                    fragments[-1] += line[cursor:start]
+                else:
+                    start = 0
+                fragments.append(line[start:end])
+                cursor = end
+            if line[cursor:].strip():
+                return [line]
+            if fragments:
+                fragments[-1] += line[cursor:]
+            return fragments or [line]
+        plain = "".join(root.itertext())
+        sentences = split_text_into_sentences(plain.strip(), self.language)
+        starts = [0]
+        cursor = 0
+        for index, sentence in enumerate(sentences):
+            offsets = match_offsets(plain, sentence, cursor)
+            if offsets is None:
+                return [line]
+            start, cursor = offsets
+            if index:
+                starts.append(start)
+        if plain[cursor:].strip():
+            return [line]
+        starts.append(len(plain))
+        spans = []
+        cursor = len(root.text or "")
+        for child in root:
+            if not isinstance(child.tag, str):
+                return [line]
+            end = cursor + len("".join(child.itertext()))
+            # Group inseparable sentences without losing safe boundaries
+            # before or after this span (including any nested markup).
+            starts = [start for start in starts if not cursor < start < end]
+            spans.append((cursor, end, child))
+            cursor = end + len(child.tail or "")
+        fragments = []
+        for start, end in zip(starts, starts[1:]):
+            pieces = []
+            cursor = start
+            for child_start, child_end, child in spans:
+                # The final unit also owns terminal empty elements, including
+                # tag-only fragments whose text range is [0, 0].
+                if (start <= child_start < end
+                        or child_start == child_end == end == len(plain)):
+                    pieces.append(html.escape(plain[cursor:child_start], quote=False))
+                    marker = copy.deepcopy(child)
+                    marker.tail = None
+                    pieces.append(ET.tostring(marker, encoding="unicode"))
+                    cursor = child_end
+            pieces.append(html.escape(plain[cursor:end], quote=False))
+            fragments.append("".join(pieces))
+        return fragments or [line]
+
+    def _recover_context(self, source_line, translate_one, translations,
+                         variant_index, option_marker_ids):
+        if source_line.endswith("\r\n"):
+            body, line_ending = source_line[:-2], "\r\n"
+        elif source_line.endswith("\n"):
+            body, line_ending = source_line[:-1], "\n"
+        else:
+            body, line_ending = source_line, ""
+        root = self._parse_fragment(body)
+
+        tokens = []
+
+        def is_option(node):
+            return node.tag == "g" and node.get("id") in option_marker_ids
+
+        def collect(node):
+            if node.text is not None:
+                tokens.append(("text", node, "text"))
+            for child in node:
+                if is_option(child):
+                    tokens.append(("option", child, None))
+                elif isinstance(child.tag, str):
+                    collect(child)
+                if child.tail is not None:
+                    tokens.append(("text", child, "tail"))
+
+        collect(root)
+
+        groups = [[]]
+        for kind, node, attribute in tokens:
+            if kind == "option":
+                groups.append([])
+            elif kind == "text":
+                groups[-1].append((node, attribute, getattr(node, attribute)))
+        source_groups = ["".join(value for _, _, value in group) for group in groups]
+        if not any(value.strip() for value in source_groups):
+            return source_line
+
+        # A blank identifies a context run, not boundaries between adjacent
+        # ExText nodes or inline formatting. Those require XML-based isolation.
+        assignable = all(sum(bool(value.strip()) for _, _, value in group) <= 1
+                         for group in groups)
+        accepted = None
+        for placeholder in self.context_placeholders:
+            if any(placeholder in value for value in source_groups):
+                continue
+            source_value = placeholder.join(source_groups)
+            cache_key = ("sentence", placeholder, tuple(source_groups))
+            cached = cache_key in translations
+            target_value = translations.get(cache_key)
+            if target_value is None:
+                target_value = self._standalone_value(translate_one(
+                    html.escape(source_value, quote=False) + "\n"))
+            if not target_value:
+                raise FrausTranslationError("FRAUS context recovery produced no usable translation")
+            parts = target_value.split(placeholder)
+            valid = (assignable and len(parts) == len(groups)
+                     and not any(other in target_value for other in self.context_placeholders
+                                 if other != placeholder)
+                     and all(bool(source.strip()) == bool(target.strip())
+                             for source, target in zip(source_groups, parts)))
+            self.fallback_diagnostics.append({
+                "type": "context_cache_hit" if cached else "context_retry",
+                "variant_index": variant_index, "strategy": placeholder,
+                "accepted": valid,
+            })
+            if valid:
+                translations[cache_key] = target_value
+                accepted = parts
+                break
+
+        for group_index, group in enumerate(groups):
+            for node, attribute, source_value in group:
+                if not source_value.strip():
+                    continue
+                if accepted is not None:
+                    target_value = accepted[group_index].strip()
+                else:
+                    cache_key = ("isolated_context", source_value.strip())
+                    cached = cache_key in translations
+                    target_value = translations.get(cache_key)
+                    if target_value is None:
+                        target_value = self._standalone_value(translate_one(
+                            html.escape(source_value.strip(), quote=False) + "\n"))
+                        if (not target_value or any(marker in target_value
+                                for marker in self.context_placeholders)):
+                            raise FrausTranslationError("FRAUS context recovery produced no usable translation")
+                        translations[cache_key] = target_value
+                    self.fallback_diagnostics.append({
+                        "type": "context_cache_hit" if cached else "context_retry",
+                        "variant_index": variant_index, "strategy": "isolated_context",
+                        "accepted": True,
+                    })
+                leading = source_value[:len(source_value) - len(source_value.lstrip())]
+                trailing = source_value[len(source_value.rstrip()):]
+                setattr(node, attribute, leading + target_value + trailing)
+
+        recovered = ET.tostring(root, encoding="unicode")
+        return recovered[len("<root>"):-len("</root>")] + line_ending
+
+    @staticmethod
+    def _option_marker_ids(line):
+        if "fraus-option-" not in line:
+            return []
+        try:
+            root = ET.fromstring(f"<root>{line.strip()}</root>")
+        except ET.ParseError:
+            return []
+        return [
+            marker.get("id") for marker in root.iter("g")
+            if marker.get("id", "").startswith("fraus-option-")
+        ]
+
+    def _variant_line_indices(self, lines):
+        if not self.variant_source_payloads:
+            return [
+                index for index, line in enumerate(lines)
+                if self._option_marker_ids(line)
+            ]
+        mapping = self._map_source_variants(lines)
+        # Only full source signatures authorize these roles. Target detection
+        # cannot reinterpret a missing option as an unrelated formatting span.
+        for _, variant_index, kinds in mapping:
+            self.variant_marker_kinds[variant_index] = kinds
+        return [line_index for line_index, _, _ in mapping]
+
+    def _map_source_variants(self, lines):
+        """Return (source line index, variant list index, g roles) from provenance.
+
+        Okapi renumbers XML codes, then adds HTML codes and renumbers again.
+        Match text and nested code boundaries instead of either set of IDs.
+        Ambiguous or incomplete associations are deliberately not guessed.
+        """
+        from html.parser import HTMLParser
+
+        class SignatureParser(HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.events = []
+                self.kinds = []
+                self.stack = []
+                self.text = []
+                self.valid = True
+
+            def flush(self):
+                value = " ".join("".join(self.text).split())
+                if value:
+                    self.events.append(("text", value))
+                self.text = []
+
+            def handle_data(self, data):
+                self.text.append(data)
+
+            def handle_starttag(self, tag, attrs):
+                self.flush()
+                if tag in ("area", "base", "br", "col", "embed", "hr", "img",
+                           "input", "link", "meta", "param", "source", "track", "wbr"):
+                    self.events.append(("empty",))
+                    return
+                self.stack.append(tag)
+                self.events.append(("start",))
+                marker_id = dict(attrs).get("id", "")
+                self.kinds.append(
+                    "option" if tag == "g" and marker_id.startswith("fraus-option-")
+                    else "text" if tag == "g" and marker_id.startswith("fraus-text-")
+                    else "format")
+
+            def handle_endtag(self, tag):
+                self.flush()
+                if not self.stack or self.stack.pop() != tag:
+                    self.valid = False
+                self.events.append(("end",))
+
+            def handle_startendtag(self, tag, attrs):
+                self.flush()
+                self.events.append(("empty",))
+
+            def signature(self, value):
+                self.feed(value)
+                self.close()
+                self.flush()
+                return tuple(self.events) if self.valid and not self.stack else None
+
+        expected = {}
+        for variant_index, payload in enumerate(self.variant_source_payloads):
+            parser = SignatureParser()
+            signature = parser.signature(payload)
+            if signature is None:
+                return []
+            expected.setdefault(signature, []).append((variant_index, parser.kinds))
+        candidates = {signature: [] for signature in expected}
+        for line_index, line in enumerate(lines):
+            try:
+                root = ET.fromstring(f"<root>{line.strip()}</root>")
+            except ET.ParseError:
+                continue
+            signature = SignatureParser().signature(line)
+            if (signature in candidates
+                    and len(list(root.iter("g"))) == len(expected[signature][0][1])):
+                candidates[signature].append(line_index)
+        mapping = []
+        for signature, variants in expected.items():
+            if len(candidates[signature]) != len(variants):
+                continue
+            mapping.extend((line_index, variant_index, kinds)
+                           for line_index, (variant_index, kinds)
+                           in zip(candidates[signature], variants))
+        mapping.sort()
+        indices = [variant_index for _, variant_index, _ in mapping]
+        if indices != sorted(indices):
+            return []
+        return mapping
+
+    @staticmethod
+    def _parse_fragment(value):
+        parser = ET.XMLParser(target=ET.TreeBuilder(
+            insert_comments=True,
+            insert_pis=True,
+        ))
+        return ET.fromstring(f"<root>{value}</root>", parser=parser)
+
+    @staticmethod
+    def _preserve_line_ending(source_line, target_line):
+        line_ending = (
+            "\r\n" if source_line.endswith("\r\n")
+            else "\n" if source_line.endswith("\n")
+            else ""
+        )
+        target_body = target_line.rstrip("\r\n")
+        if "\n" in target_body or "\r" in target_body:
+            raise AssertionError("FRAUS line recovery changed line count")
+        return target_body + line_ending
 
     @staticmethod
     def _standalone_value(translation):
         value = translation.strip()
         if not value:
             return ""
-        try:
-            root = ET.fromstring(f"<root>{value}</root>")
-            return "".join(root.itertext()).strip()
-        except ET.ParseError:
-            return re.sub(r"<[^>]+>", "", value).strip()
-
-    @staticmethod
-    def _keep_one_marker(line, marker_index):
-        root = ET.fromstring(f"<root>{line.rstrip(chr(10))}</root>")
-        markers = list(root.iter("g"))
-        selected = markers[marker_index]
-
-        def render(node):
-            result = html.escape(node.text or "", quote=False)
-            for child in node:
-                content = render(child)
-                if child is selected:
-                    result += f'<g id="{child.get("id", "")}">{content}</g>'
-                else:
-                    result += content
-                result += html.escape(child.tail or "", quote=False)
-            return result
-
-        return render(root) + "\n"
-
+        if _TAG_TOKEN_RE.search(value):
+            raise FrausTranslationError("FRAUS recovery returned markup instead of plain text")
+        return html.unescape(value)
 
 XML_TRANSFORMS = {
     "fraus_v2": FrausV2XmlTransform,
@@ -808,7 +1241,7 @@ class DocumentPipeline:
 
 
 class InnerLindatTranslator(Translator):
-    def __init__(self, method, src, tgt, model=None, custom_prompt=None, terms=None, split=True):
+    def __init__(self, method, src, tgt, model=None, custom_prompt=None, terms=None, split=True, strict=False):
         self.method = method
         self.src = src
         self.tgt = tgt
@@ -816,8 +1249,15 @@ class InnerLindatTranslator(Translator):
         self.split = split
         self.custom_prompt = custom_prompt
         self.debug_segments = []
+        self.strict = strict
 
     def translate(self, input_text: str, split=True) -> Tuple[List[str], List[str]]:
+        from app.models.llm_request_state import get_request_llm_state
+
+        if self.strict and not input_text.strip():
+            return [input_text], [input_text]
+        state = get_request_llm_state() if self.strict else None
+        record_count = len(state.records) if state is not None else 0
         num_prefix_newlines = 0
         if input_text.startswith("\n"):
             while input_text[num_prefix_newlines] == "\n":
@@ -843,6 +1283,21 @@ class InnerLindatTranslator(Translator):
                 self.src, self.tgt, input_text, return_source_sentences=True,
                 custom_prompt=self.custom_prompt, split=split,
             )
+
+        if self.strict:
+            if state is not None:
+                for record in state.records[record_count:]:
+                    if not record.translated:
+                        raise record.error or FrausTranslationError(
+                            'FRAUS v2 backend retained untranslated source'
+                        )
+            if len(src_sentences) != len(tgt_sentences):
+                raise FrausTranslationError('FRAUS v2 backend returned mismatched sentence counts')
+            if input_text.strip() and (
+                    not tgt_sentences or not ''.join(tgt_sentences).strip()
+                    or any(source.strip() and not target.strip()
+                           for source, target in zip(src_sentences, tgt_sentences))):
+                raise FrausTranslationError('FRAUS v2 backend returned empty text')
 
         self.debug_segments.extend(
             {"source": source, "target": target}
@@ -939,11 +1394,6 @@ class Document(Translatable):
         return f"{orig_root}.{tgt}{file_extension}"
 
     def _extract_translate_merge_fraus(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
-        from app.models.llm_request_state import (
-            llm_state_checkpoint,
-            rollback_llm_state,
-        )
-
         app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         args = text_input_with_src_tgt.parse_args(request)
         transform_name = args.get('xmlTransform')
@@ -972,45 +1422,9 @@ class Document(Translatable):
                 app_dir, 'okapi_profiles', 'okf_xml@fraus_v2.fprm'
             )
         self.xml_transform = document_format.xml_transform
-        source_bytes = None
-        if self.xml_transform is not None:
-            with open(self.orig_full_path, "rb") as source_file:
-                source_bytes = source_file.read()
-        checkpoint = llm_state_checkpoint()
-        try:
-            self._run_document_pipeline(
-                document_format, src, tgt, method, model, custom_prompt, terms, split
-            )
-        except Exception as error:
-            retryable = isinstance(
-                error, (AssertionError, TikalError)
-            ) or (isinstance(error, ValueError)
-                  and "paired tag" in str(error).lower())
-            if source_bytes is None or not retryable:
-                raise
-            rollback_llm_state(checkpoint)
-            self._fallback_diagnostics.append({
-                "type": "document_pipeline_fallback",
-                "strategy": "legacy_fraus",
-                "reason": (
-                    "paired_tag" if isinstance(error, ValueError)
-                    else type(error).__name__
-                ),
-            })
-            with open(self.orig_full_path, "wb") as source_file:
-                source_file.write(source_bytes)
-            translated_path = self.get_translated_path(tgt)
-            if os.path.exists(translated_path):
-                os.remove(translated_path)
-            self.xml_transform = None
-            legacy_format = FrausDocumentFormat(
-                TikalRunner(TIKAL_PATH),
-                os.path.join(app_dir, 'okapi_profiles', 'okf_xml@fraus.fprm'),
-                os.path.join(app_dir, 'okapi_profiles', 'okf_html@fraus.fprm'),
-            )
-            self._run_document_pipeline(
-                legacy_format, src, tgt, method, model, custom_prompt, terms, split
-            )
+        return self._run_document_pipeline(
+            document_format, src, tgt, method, model, custom_prompt, terms, split
+        )
 
     def _extract_translate_merge_document(self, src, tgt, method, model, custom_prompt=None, terms=None, split=True):
         profile = None
@@ -1040,8 +1454,17 @@ class Document(Translatable):
         self.debug_trace = dict(result.trace)
         if self.debug_segments:
             self.debug_trace["llm_segments"] = self.debug_segments
+        if debug and isinstance(self.xml_transform, FrausV2XmlTransform):
+            self.debug_trace["fraus_sentence_units"] = [
+                {"line_index": line_index, "unit_index": unit_index,
+                 "source": source, "target": target}
+                for line_index, units in self.xml_transform.translated_units.items()
+                for unit_index, (source, target) in enumerate(units)
+            ]
         if debug and self._fallback_diagnostics:
             self.debug_trace["fallbacks"] = copy.deepcopy(self._fallback_diagnostics)
+            if isinstance(self.xml_transform, FrausV2XmlTransform):
+                self.debug_trace['fraus_recovery'] = copy.deepcopy(self._fallback_diagnostics)
         if debug:
             from app.models.llm_request_state import get_request_llm_state
 
@@ -1071,6 +1494,7 @@ class Document(Translatable):
         if self._input_nfc_len >= MAX_TEXT_LENGTH and not args.get('ignoreSizeLimit', False):
             api.abort(code=413, message='The total text length in the document exceeds the translation limit.')
         self.debug_segments = []
+        strict = isinstance(self.xml_transform, FrausV2XmlTransform)
 
         def translate_markup(text):
             from app.models.llm_request_state import (
@@ -1082,6 +1506,7 @@ class Document(Translatable):
             translator = InnerLindatTranslator(
                 method, src, tgt, model, custom_prompt=custom_prompt,
                 terms=terms, split=split,
+                strict=strict,
             )
             mt = MarkupTranslator(
                 translator, LindatAligner(src, tgt, show_progress=False), RegexTokenizer()
@@ -1089,27 +1514,97 @@ class Document(Translatable):
             try:
                 result = mt.translate(text)
                 result = sanitize_generated_markup(text, result)
-            except Exception:
-                rollback_llm_state(checkpoint)
+            except Exception as error:
+                if not strict or isinstance(error, (AssertionError, ValueError)):
+                    rollback_llm_state(checkpoint)
                 raise
             self.debug_segments.extend(translator.debug_segments)
             return result
 
-        self.translation = translate_with_line_fallback(
-            self.text,
-            translate_markup,
-            lambda line_count: self._fallback_diagnostics.append({
-                "type": "line_alignment_retry",
-                "line_count": line_count,
-            }),
-        )
+        def translate_plain(text):
+            """Translate XML-escaped plain text, returning XML-escaped text."""
+            translator = InnerLindatTranslator(
+                method, src, tgt, model, custom_prompt=custom_prompt,
+                terms=terms, split=split, strict=True,
+            )
+            _, targets = translator.translate(unescape(text), split=split)
+            self.debug_segments.extend(translator.debug_segments)
+            return escape(''.join(targets), quote=False)
+
+        if strict:
+            lines = []
+            source_lines = self.text.splitlines(keepends=True)
+            variant_indices = set(self.xml_transform._variant_line_indices(source_lines))
+            self.xml_transform.translated_units = {}
+            for index, line in enumerate(source_lines):
+                body = line.rstrip('\r\n')
+                ending = line[len(body):]
+                if not body.strip():
+                    lines.append(line)
+                    continue
+                units = []
+                for unit_index, source_unit in enumerate(self.xml_transform._sentence_fragments(body)):
+                    try:
+                        candidate = translate_markup(source_unit)
+                    except (AssertionError, ValueError) as error:
+                        if isinstance(error, ValueError) and 'paired tag' not in str(error).lower():
+                            raise
+                        candidate = ''
+                        if index not in variant_indices and 'fraus-option-' not in source_unit:
+                            try:
+                                root = self.xml_transform._parse_fragment(source_unit)
+                            except ET.ParseError as parse_error:
+                                raise FrausTranslationError(
+                                    'Cannot preserve markup during FRAUS sentence recovery'
+                                ) from parse_error
+                            for node in root.iter():
+                                for attribute in ('text', 'tail'):
+                                    value = getattr(node, attribute)
+                                    if value and value.strip() and isinstance(node.tag, str):
+                                        target = unescape(translate_plain(escape(value, quote=False)))
+                                        leading = value[:len(value) - len(value.lstrip())]
+                                        trailing = value[len(value.rstrip()):]
+                                        setattr(node, attribute, leading + target.strip() + trailing)
+                            candidate = (escape(root.text or '', quote=False) + ''.join(
+                                ET.tostring(child, encoding='unicode') for child in root
+                            ))
+                        self._fallback_diagnostics.append({
+                            'type': 'line_alignment_recovery',
+                            'line_index': index, 'unit_index': unit_index,
+                            'strategy': 'transform_recovery' if not candidate else 'plain_text_nodes',
+                            'reason': type(error).__name__,
+                        })
+                    else:
+                        if unescape(re.sub(r'<[^>]*>', '', source_unit)).strip() and not unescape(
+                                re.sub(r'<[^>]*>', '', candidate)).strip():
+                            raise FrausTranslationError('FRAUS v2 backend returned empty text')
+                    # Output sentence counts do not define ownership. Keep the
+                    # entire response in its source unit, including its separators.
+                    leading = source_unit[:len(source_unit) - len(source_unit.lstrip())]
+                    trailing = source_unit[len(source_unit.rstrip()):]
+                    candidate = leading + ' '.join(candidate.strip().splitlines()) + trailing
+                    units.append((source_unit, candidate))
+                self.xml_transform.translated_units[index] = units
+                lines.append(''.join(target for _, target in units) + ending)
+            self.translation = ''.join(lines)
+        else:
+            self.translation = translate_with_line_fallback(
+                self.text,
+                translate_markup,
+                lambda line_count: self._fallback_diagnostics.append({
+                    "type": "line_alignment_retry",
+                    "line_count": line_count,
+                }),
+            )
         if self.xml_transform is not None and hasattr(self.xml_transform, "fallback"):
-            self.translation = self.xml_transform.fallback(
-                self.text, self.translation, translate_markup
-            )
-            self._fallback_diagnostics.extend(
-                self.xml_transform.fallback_diagnostics
-            )
+            try:
+                self.translation = self.xml_transform.fallback(
+                    self.text, self.translation, translate_plain if strict else translate_markup
+                )
+            finally:
+                self._fallback_diagnostics.extend(
+                    self.xml_transform.fallback_diagnostics
+                )
         self._output_word_count = len(self.translation.split())
 
     def get_text(self):
@@ -1119,6 +1614,10 @@ class Document(Translatable):
         return self.translation
 
     def create_response(self, extra_headers):
+        recovery = (self._fallback_diagnostics
+                    if isinstance(self.xml_transform, FrausV2XmlTransform) else [])
+        if recovery:
+            extra_headers = {**extra_headers, 'X-FRAUS-Recovery': 'recovered'}
         if str(request.values.get('debug', '')).lower() in {'1', 'true', 'yes'}:
             from flask import jsonify
             import base64
@@ -1126,11 +1625,15 @@ class Document(Translatable):
             try:
                 with open(self.translated_path, 'rb') as translated_file:
                     output = base64.b64encode(translated_file.read()).decode('ascii')
-                response = jsonify({
+                payload = {
                     'filename': os.path.basename(self.translated_path),
                     'output_base64': output,
                     'trace': self.debug_trace,
-                })
+                }
+                if recovery:
+                    payload['fraus_recovery'] = copy.deepcopy(recovery)
+                    payload['trace'] = {**self.debug_trace, 'fraus_recovery': copy.deepcopy(recovery)}
+                response = jsonify(payload)
                 response.headers.extend({**self.prep_billing_headers(), **extra_headers})
                 return response
             finally:

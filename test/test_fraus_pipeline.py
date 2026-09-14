@@ -20,6 +20,7 @@ from app.main.document import (
     DocumentPipeline,
     FrausV2XmlTransform,
     FrausDocumentFormat,
+    FrausTranslationError,
     StandardDocumentFormat,
     TikalError,
     TikalRunner,
@@ -173,7 +174,8 @@ class FrausTransformTests(unittest.TestCase):
             for variant_index, payload in enumerate(
                     tree.findall('.//Questions//RA/ExText')):
                 for option_index, marker in enumerate(payload.findall('./g')):
-                    marker.text = f'target-{variant_index}-{option_index}'
+                    if marker.get('id', '').startswith('fraus-option-'):
+                        marker.text = f'target-{variant_index}-{option_index}'
             tree.write(prepared, encoding='utf-8', xml_declaration=True)
             transform.postprocess(prepared, restored)
 
@@ -231,7 +233,10 @@ class FrausTransformTests(unittest.TestCase):
 </RA></Question></Questions></DOC>''')
             transform.preprocess(source, prepared)
             payloads = ET.parse(prepared).findall('.//Questions//RA/ExText')
-            values = [[marker.text for marker in payload.iter('g')] for payload in payloads]
+            values = [[
+                marker.text for marker in payload.iter('g')
+                if marker.get('id', '').startswith('fraus-option-')
+            ] for payload in payloads]
             self.assertEqual(values, [['a', 'c'], ['b', 'd'], ['a', 'e'], ['b', 'f']])
 
     def test_fix_encoding_only_changes_xml_declaration(self):
@@ -428,7 +433,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(os.path.exists(output))
             self.assertFalse(os.path.exists(source + '.preprocessed'))
 
-    def test_fraus_v2_failure_restores_source_and_retries_legacy_pipeline(self):
+    def test_fraus_v2_failure_propagates_without_legacy_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             source = os.path.join(directory, 'input.xml')
             original = b'<DOC><RA><ExText>Original</ExText></RA></DOC>'
@@ -440,33 +445,47 @@ class PipelineTests(unittest.TestCase):
             def run(document_format, src, tgt, method, model,
                     custom_prompt, terms, split):
                 calls.append(document_format)
-                if len(calls) == 1:
-                    os.remove(source)
-                    with open(document.get_translated_path(tgt), 'w', encoding='utf-8') as file:
-                        file.write('partial')
-                    raise TikalError('merge failed')
-                self.assertTrue(os.path.exists(source))
-                with open(source, 'rb') as file:
-                    self.assertEqual(file.read(), original)
-                self.assertFalse(os.path.exists(document.get_translated_path(tgt)))
+                raise TikalError('merge failed')
 
             with patch.object(
                     text_input_with_src_tgt, 'parse_args',
                     return_value={'xmlTransform': 'fraus_v2'}), patch.object(
                     document, '_run_document_pipeline', side_effect=run):
-                document._extract_translate_merge_fraus(
-                    'cs', 'uk', 'from_to', None
-                )
+                with self.assertRaisesRegex(TikalError, 'merge failed'):
+                    document._extract_translate_merge_fraus(
+                        'cs', 'uk', 'from_to', None
+                    )
 
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 1)
             self.assertIsInstance(calls[0].xml_transform, FrausV2XmlTransform)
-            self.assertIsNone(calls[1].xml_transform)
-            self.assertIsNone(document.xml_transform)
-            self.assertEqual(document._fallback_diagnostics, [{
-                'type': 'document_pipeline_fallback',
-                'strategy': 'legacy_fraus',
-                'reason': 'TikalError',
-            }])
+            self.assertIs(document.xml_transform, calls[0].xml_transform)
+            self.assertEqual(document._fallback_diagnostics, [])
+
+    def test_document_retains_transform_diagnostics_when_recovery_fails(self):
+        app = Flask(__name__)
+        document = Document('/tmp/input.xml')
+        document.text = 'source\n'
+
+        class FailingTransform:
+            fallback_diagnostics = [{
+                'type': 'unsafe_context_variant',
+                'variant_index': 0,
+            }]
+
+            def fallback(self, source, target, translate):
+                raise FrausTranslationError('context recovery produced no usable translation')
+
+        document.xml_transform = FailingTransform()
+        with app.test_request_context('/'), patch(
+                'app.main.document.translate_with_line_fallback',
+                return_value='target\n'):
+            with self.assertRaisesRegex(FrausTranslationError, 'context recovery'):
+                document._translate('cs', 'en', 'from_to')
+
+        self.assertEqual(document._fallback_diagnostics, [{
+            'type': 'unsafe_context_variant',
+            'variant_index': 0,
+        }])
 
     def test_document_adds_fallback_details_only_to_debug_trace(self):
         app = Flask(__name__)
@@ -546,7 +565,7 @@ class PipelineTests(unittest.TestCase):
                  ('Image', 'image'), ('ExText', ra[-1].get('Id'))],
             )
 
-    def test_fraus_v2_preserves_original_option_when_translation_is_empty(self):
+    def test_fraus_v2_postprocess_rejects_empty_option_without_source_copy(self):
         transform = FrausV2XmlTransform()
         with tempfile.TemporaryDirectory() as directory:
             source = os.path.join(directory, 'input.xml')
@@ -560,11 +579,41 @@ class PipelineTests(unittest.TestCase):
             tree = ET.parse(prepared)
             tree.find('.//Questions//RA/ExText/g').text = ''
             tree.write(prepared, encoding='utf-8', xml_declaration=True)
-            transform.postprocess(prepared, restored)
-            self.assertEqual(
-                ET.parse(restored).findtext('.//InputOption/SelectOption/ExText'),
-                'original',
-            )
+            with self.assertRaises(FrausTranslationError):
+                transform.postprocess(prepared, restored)
+            self.assertFalse(os.path.exists(restored))
+
+    def test_fraus_v2_postprocess_rejects_missing_context_without_source_copy(self):
+        for missing in ('before', 'after', 'payload'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                transform = FrausV2XmlTransform()
+                source = os.path.join(directory, 'input.xml')
+                prepared = os.path.join(directory, 'prepared.xml')
+                restored = os.path.join(directory, 'restored.xml')
+                with open(source, 'w', encoding='utf-8') as file:
+                    file.write('''<DOC><Questions><Question><RA>
+<ExText Id="before">Before </ExText>
+<InputOption><SelectOption><ExText>one</ExText></SelectOption></InputOption>
+<ExText Id="after"> after.</ExText>
+</RA></Question></Questions></DOC>''')
+                transform.preprocess(source, prepared)
+                tree = ET.parse(prepared)
+                ra = tree.find('.//Questions//RA')
+                payload = ra.find('ExText')
+                marker = payload.find('g')
+                payload.text = 'Translated before '
+                marker.text = 'accepted option'
+                marker.tail = ' translated after.'
+                if missing == 'before':
+                    payload.text = None
+                elif missing == 'after':
+                    marker.tail = None
+                else:
+                    ra.remove(payload)
+                tree.write(prepared, encoding='utf-8', xml_declaration=True)
+                with self.assertRaises(FrausTranslationError):
+                    transform.postprocess(prepared, restored)
+                self.assertFalse(os.path.exists(restored))
 
     def test_fraus_v2_preserves_translated_documents_without_option_ras(self):
         transform = FrausV2XmlTransform()
@@ -622,7 +671,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(len(list(output.iter('ExText'))), len(list(ET.parse(source).getroot().iter('ExText'))))
                 self.assertFalse(any('fraus' in str(element.tag) for element in output.iter()))
 
-    def test_fraus_v2_ignores_outer_nested_option_markers(self):
+    def test_fraus_v2_postprocess_rejects_missing_outer_nested_option(self):
         transform = FrausV2XmlTransform()
         with tempfile.TemporaryDirectory() as directory:
             source = os.path.join(directory, 'input.xml')
@@ -639,76 +688,120 @@ class PipelineTests(unittest.TestCase):
             transform.preprocess(source, prepared)
             tree = ET.parse(prepared)
             payload = tree.find('.//Questions//RA/ExText')
-            first, second = list(payload)
+            first, second = [
+                marker for marker in payload
+                if marker.get('id', '').startswith('fraus-option-')
+            ]
             first.text = 'context '
             second.text = 'translated-two'
             payload.remove(second)
             first.append(second)
             tree.write(translated, encoding='utf-8', xml_declaration=True)
-            transform.postprocess(translated, restored)
-            values = [x.text for x in ET.parse(restored).findall('.//InputOption/SelectOption/ExText')]
-            self.assertEqual(values, ['one', 'translated-two'])
+            with self.assertRaises(FrausTranslationError):
+                transform.postprocess(translated, restored)
+            self.assertFalse(os.path.exists(restored))
 
-    def test_fraus_v2_fallback_retries_variants_when_line_counts_change(self):
+    def test_fraus_v2_fallback_rejects_variants_when_line_counts_change(self):
         transform = FrausV2XmlTransform()
         transform.variant_sequence = [['select-1'], ['select-2']]
-        source = '<g id="1">one</g>\n<g id="1">two</g>\n'
-        translated = '<g id="1"><g id="2">one target</g></g>\n'
-        calls = []
-
-        def translate_one(text):
-            calls.append(text)
-            return '<g id="1">clean target</g>\n'
-
-        result = transform.fallback(source, translated, translate_one)
-        self.assertEqual(result, source)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(transform.fallback_values, {
-            'select-1': 'clean target',
-            'select-2': 'clean target',
-        })
+        source = ('<g id="fraus-option-select-1">one</g>\n'
+                  '<g id="fraus-option-select-2">two</g>\n')
+        translated = ('<g id="fraus-option-select-1">'
+                      '<g id="nested">one target</g></g>\n')
+        with self.assertRaisesRegex(AssertionError, 'line structure'):
+            transform.fallback(source, translated, lambda text: text)
 
     def test_fraus_v2_fallback_uses_standalone_option_translation(self):
         transform = FrausV2XmlTransform()
         transform.variant_sequence = [['select-1']]
-        source = '<g id="1">one</g>\n'
-        translated = '<g id="1"><g id="2">contaminated context</g></g>\n'
+        source = '<g id="fraus-option-select-1">one</g>\n'
+        translated = ('<g id="fraus-option-select-1">'
+                      '<g id="nested">contaminated context</g></g>\n')
         calls = []
 
         def translate_one(text):
             calls.append(text)
-            if '<g' in text:
-                return '<g id="1"><g id="2">too much context</g></g>\n'
             return 'standalone target\n'
 
         result = transform.fallback(source, translated, translate_one)
-        self.assertEqual(result, source)
+        self.assertEqual(result, '<g id="fraus-option-select-1">standalone target</g>\n')
         self.assertEqual(transform.fallback_values['select-1'], 'standalone target')
-        self.assertEqual(calls, ['<g id="1">one</g>\n', 'one\n'])
-        self.assertEqual(transform.fallback_diagnostics[-1]['strategy'],
-                         'standalone')
+        self.assertEqual(calls, [
+            'one\n'
+        ])
+        self.assertEqual(
+            [item['strategy'] for item in transform.fallback_diagnostics
+             if item['type'] == 'option_retry'], ['standalone'],
+        )
 
-    def test_fraus_v2_fallback_rejects_excessive_standalone_translation(self):
+    def test_fraus_v2_fallback_isolates_option_with_wrong_marker_id(self):
         transform = FrausV2XmlTransform()
         transform.variant_sequence = [['select-1']]
 
+        calls = []
+
         def translate_one(text):
-            if '<g' in text:
-                return '<g id="1"><g id="2">contaminated</g></g>\n'
-            return 'one two three four five six seven eight nine ten\n'
+            calls.append(text)
+            return 'standalone target\n'
 
         transform.fallback(
-            '<g id="1">one</g>\n',
-            '<g id="1"><g id="2">contaminated</g></g>\n',
+            '<g id="fraus-option-select-1">one</g>\n',
+            '<g id="wrong">wrong target</g>\n',
             translate_one,
         )
-        self.assertIsNone(transform.fallback_values['select-1'])
 
-    def test_fraus_v2_fallback_retries_missing_or_extra_flat_markers(self):
-        source = '<g id="first">one</g> and <g id="second">two</g>\n'
+        self.assertEqual(transform.fallback_values['select-1'], 'standalone target')
+        self.assertEqual(calls, ['one\n'])
+        self.assertEqual(
+            [item['strategy'] for item in transform.fallback_diagnostics
+             if item['type'] == 'option_retry'], ['standalone'],
+        )
+
+    def test_fraus_v2_fallback_accepts_long_plain_option_translation(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['select-1']]
+
+        value = 'one two three four five six seven eight nine ten'
+        result = transform.fallback(
+            '<g id="fraus-option-select-1">one</g>\n',
+            '<g id="fraus-option-select-1"><g id="nested">contaminated</g></g>\n',
+            lambda text: value + '\n',
+        )
+        self.assertEqual(result, f'<g id="fraus-option-select-1">{value}</g>\n')
+        self.assertEqual(transform.fallback_values['select-1'], value)
+
+    def test_fraus_v2_fallback_accepts_unchanged_multiword_option(self):
+        transform = FrausV2XmlTransform(language='cs')
+        transform.variant_sequence = [['select-1']]
+
+        transform.fallback(
+            '<g id="fraus-option-select-1">Los Angeles</g>\n',
+            '<g id="fraus-option-select-1"><g id="nested">bad</g></g>\n',
+            lambda text: text,
+        )
+
+        self.assertEqual(transform.fallback_values['select-1'], 'Los Angeles')
+
+    def test_fraus_v2_fallback_allows_unchanged_measurement_unit(self):
+        transform = FrausV2XmlTransform(language='cs')
+        transform.variant_sequence = [['select-1']]
+
+        transform.fallback(
+            '<g id="fraus-option-select-1">km</g>\n',
+            '<g id="fraus-option-select-1"><g id="nested">bad</g></g>\n',
+            lambda text: text,
+        )
+
+        self.assertEqual(transform.fallback_values['select-1'], 'km')
+
+    def test_fraus_v2_fallback_retains_valid_options_with_missing_or_extra_tags(self):
+        source = ('<g id="fraus-option-select-1">one</g> and '
+                  '<g id="fraus-option-select-2">two</g>\n')
         targets = [
-            '<g id="first">uno</g> and two\n',
-            '<g id="first">uno</g> and <g id="second">dos</g> <g id="extra">extra</g>\n',
+            '<g id="fraus-option-select-1">uno</g> and two\n',
+            ('<g id="fraus-option-select-1">uno</g> and '
+             '<g id="fraus-option-select-2">dos</g> '
+             '<g id="fraus-option-extra">extra</g>\n'),
         ]
         for target in targets:
             with self.subTest(target=target):
@@ -718,15 +811,23 @@ class PipelineTests(unittest.TestCase):
 
                 def translate_one(text):
                     calls.append(text)
-                    marker_id = 'first' if 'first' in text else 'second'
-                    return f'<g id="{marker_id}">clean target</g>\n'
+                    if '__BLANK__' in text:
+                        return text.replace('and', 'and target')
+                    self.assertEqual(text, 'two\n')
+                    return 'clean target\n'
 
-                transform.fallback(source, target, translate_one)
-                self.assertEqual(len(calls), 2)
-                self.assertEqual(transform.fallback_values, {
-                    'select-1': 'clean target',
-                    'select-2': 'clean target',
-                })
+                result = transform.fallback(source, target, translate_one)
+                missing = 'fraus-option-select-2' not in target
+                self.assertEqual(calls, (['two\n'] if missing else []) + [
+                    '__BLANK__ and __BLANK__\n',
+                ])
+                root = ET.fromstring(f'<root>{result}</root>')
+                self.assertEqual(
+                    [(node.get('id'), node.text) for node in root],
+                    [('fraus-option-select-1', 'uno'),
+                     ('fraus-option-select-2', 'clean target' if missing else 'dos')],
+                )
+                self.assertEqual(root[0].tail, ' and target ')
 
     def test_fraus_v2_fallback_retries_empty_markers(self):
         transform = FrausV2XmlTransform()
@@ -735,14 +836,16 @@ class PipelineTests(unittest.TestCase):
 
         def translate_one(text):
             calls.append(text)
-            return '<g id="first">clean target</g>\n'
+            return 'clean target\n'
 
         transform.fallback(
-            '<g id="first">one</g>\n',
-            '<g id="first"></g>\n',
+            '<g id="fraus-option-select-1">one</g>\n',
+            '<g id="fraus-option-select-1"></g>\n',
             translate_one,
         )
-        self.assertEqual(calls, ['<g id="first">one</g>\n'])
+        self.assertEqual(calls, [
+            'one\n'
+        ])
         self.assertEqual(transform.fallback_values['select-1'], 'clean target')
 
     def test_fraus_v2_fallback_ignores_consecutive_text_markers(self):
@@ -756,17 +859,27 @@ class PipelineTests(unittest.TestCase):
 
         def translate_one(text):
             calls.append(text)
-            return '<g id="fraus-option-choice">clean target</g>\n'
+            if '__BLANK__' in text or '__PLACEHOLDER__' in text:
+                return text.replace('First', 'First target').replace(
+                    'Second', 'Second target'
+                )
+            return {'one\n': 'clean target\n',
+                    'First\n': 'First target\n',
+                    'Second\n': 'Second target\n'}[text]
 
-        transform.fallback(
+        result = transform.fallback(
             source,
             '<g id="fraus-text-1">First Second</g>'
             '<g id="fraus-option-choice"><g id="nested">bad</g></g>\n',
             translate_one,
         )
 
-        self.assertEqual(len(calls), 1)
-        self.assertIn('<g id="fraus-option-choice">one</g>', calls[0])
+        self.assertEqual(calls, [
+            'one\n', 'FirstSecond__BLANK__\n',
+            'FirstSecond__PLACEHOLDER__\n', 'First\n', 'Second\n',
+        ])
+        self.assertEqual(result, 'First target<g id="fraus-text-1">Second target</g>'
+                         '<g id="fraus-option-choice">clean target</g>\n')
         self.assertEqual(transform.fallback_values['choice'], 'clean target')
 
     def test_fraus_v2_fallback_rejects_markup_absorbed_by_option(self):
@@ -776,42 +889,510 @@ class PipelineTests(unittest.TestCase):
 
         def translate_one(text):
             calls.append(text)
-            if '<g' in text:
-                return '<g id="first">target<br/>context</g>\n'
+            if '__BLANK__' in text:
+                return text.replace('context', 'translated context')
             return 'standalone target\n'
 
         transform.fallback(
-            '<g id="first">one</g> context<br/>\n',
-            '<g id="first">target<br/>context</g>\n',
+            '<g id="fraus-option-select-1">one</g> context<br/>\n',
+            '<g id="fraus-option-select-1">target<br/>context</g>\n',
             translate_one,
         )
         self.assertEqual(transform.fallback_values['select-1'], 'standalone target')
         self.assertEqual(calls, [
-            '<g id="first">one</g> context\n',
             'one\n',
+            '__BLANK__ context\n',
         ])
 
-    def test_fraus_v2_retry_escapes_literal_comparison_symbols(self):
-        retry = FrausV2XmlTransform._keep_one_marker(
-            '<g id="first">25 321 &lt;</g> 52 213 &gt; 24 695\n', 0
-        )
-        self.assertEqual(
-            retry,
-            '<g id="first">25 321 &lt;</g> 52 213 &gt; 24 695\n',
-        )
-        ET.fromstring(f'<root>{retry}</root>')
+    def test_fraus_v2_fallback_preserves_literal_comparisons_and_entities(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+        calls = []
 
-    def test_fraus_v2_preserves_ambiguous_source_markup(self):
+        def translate_one(text):
+            calls.append(text)
+            return text
+
+        source = ('<g id="fraus-option-choice">25 321 &lt;</g>'
+                  ' 52 213 &gt; 24 695 &amp; A\n')
+        result = transform.fallback(source, '<g id="wrong">bad</g>\n', translate_one)
+        self.assertEqual(calls, ['25 321 &lt;\n',
+                                '__BLANK__ 52 213 &gt; 24 695 &amp; A\n'])
+        self.assertEqual(result, source)
+        root = ET.fromstring(f'<root>{result}</root>')
+        self.assertEqual(root[0].text, '25 321 <')
+        self.assertEqual(root[0].tail, ' 52 213 > 24 695 & A\n')
+
+    def test_fraus_v2_ignores_unrelated_g_markup(self):
         transform = FrausV2XmlTransform()
         transform.variant_sequence = [['select-1']]
         source = '<g id="format"><g id="option">one</g></g>\n'
+        translated = '<g id="format"><g id="option">target</g></g>\n'
+        self.assertEqual(
+            transform.fallback(source, translated, lambda text: text),
+            translated,
+        )
+        self.assertEqual(transform.fallback_diagnostics, [])
+
+    def test_fraus_v2_fallback_translates_source_context_segments(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+        source = (
+            'Český začátek <g id="fraus-option-choice">volba</g>'
+            ' český konec.\n'
+        )
+
+        calls = []
+
+        def translate_one(text):
+            calls.append(text)
+            if '__BLANK__' in text or '__PLACEHOLDER__' in text:
+                return 'marker removed\n'
+            return {'volba\n': 'choice\n',
+                    'Český začátek\n': 'English start\n',
+                    'český konec.\n': 'English end.\n'}[text]
+
         result = transform.fallback(
             source,
-            '<g id="format"><g id="option"><g id="extra">target</g></g></g>\n',
-            lambda text: text,
+            '<g id="fraus-option-choice"><g id="nested">bad</g></g>\n',
+            translate_one,
         )
-        self.assertEqual(result, source)
-        self.assertIsNone(transform.fallback_values['select-1'])
+
+        self.assertEqual(
+            result,
+            'English start <g id="fraus-option-choice">choice</g> English end.\n',
+        )
+        self.assertEqual(transform.fallback_values['choice'], 'choice')
+        self.assertNotIn('Český', result)
+        self.assertNotIn('český', result)
+        self.assertEqual(calls, [
+            'volba\n', 'Český začátek __BLANK__ český konec.\n',
+            'Český začátek __PLACEHOLDER__ český konec.\n',
+            'Český začátek\n', 'český konec.\n',
+        ])
+        self.assertEqual(
+            [item['strategy'] for item in transform.fallback_diagnostics
+             if item['type'] == 'context_retry'],
+            ['__BLANK__', '__PLACEHOLDER__', 'isolated_context', 'isolated_context'],
+        )
+
+    def test_fraus_v2_recovery_round_trips_context_and_options(self):
+        transform = FrausV2XmlTransform()
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'input.xml')
+            prepared = os.path.join(directory, 'prepared.xml')
+            translated = os.path.join(directory, 'translated.xml')
+            restored = os.path.join(directory, 'restored.xml')
+            with open(source, 'w', encoding='utf-8') as file:
+                file.write('''<DOC><Questions><Question><RA>
+<ExText Id="before">Before </ExText>
+<InputOption><SelectOption><ExText Id="one">one</ExText></SelectOption><SelectOption><ExText Id="two">two</ExText></SelectOption></InputOption>
+<ExText Id="after"> after.</ExText>
+</RA></Question></Questions></DOC>''')
+
+            transform.preprocess(source, prepared)
+            tree = ET.parse(prepared)
+            payloads = tree.findall('.//Questions//RA/ExText')
+
+            def inner_xml(payload):
+                return (payload.text or '') + ''.join(
+                    ET.tostring(child, encoding='unicode')
+                    for child in payload
+                )
+
+            source_text = '\n'.join(inner_xml(payload) for payload in payloads) + '\n'
+            bad_lines = []
+            for line in source_text.splitlines():
+                root = ET.fromstring(f'<root>{line}</root>')
+                marker = next(
+                    item for item in root.iter('g')
+                    if item.get('id', '').startswith('fraus-option-')
+                )
+                nested = ET.SubElement(marker, 'g', {'id': 'bad'})
+                nested.text, marker.text = marker.text, None
+                serialized = ET.tostring(root, encoding='unicode')
+                bad_lines.append(serialized[len('<root>'):-len('</root>')])
+            bad_translation = '\n'.join(bad_lines) + '\n'
+
+            def translate_one(text):
+                if '__BLANK__' in text:
+                    return text.replace('Before', 'Target before').replace(
+                        'after.', 'target after.'
+                    )
+                self.assertIn(text, ['one\n', 'two\n'])
+                return 'target ' + text
+
+            recovered = transform.fallback(
+                source_text, bad_translation, translate_one
+            )
+            for payload, line in zip(payloads, recovered.splitlines()):
+                root = ET.fromstring(f'<root>{line}</root>')
+                payload.text = root.text
+                payload[:] = list(root)
+            tree.write(translated, encoding='utf-8', xml_declaration=True)
+            transform.postprocess(translated, restored)
+
+            root = ET.parse(restored).getroot()
+            self.assertEqual(
+                [item.text for item in root.findall('.//Questions//RA/ExText')],
+                ['Target before ', ' target after.'],
+            )
+            self.assertEqual(
+                [item.text for item in root.findall(
+                    './/InputOption/SelectOption/ExText')],
+                ['target one', 'target two'],
+            )
+            self.assertEqual(
+                [item.get('Id') for item in root.findall('.//Questions//RA/ExText')],
+                ['before', 'after'],
+            )
+            self.assertEqual(
+                [item.get('Id') for item in root.findall('.//InputOption/SelectOption/ExText')],
+                ['one', 'two'],
+            )
+
+    def test_fraus_v2_fallback_rejects_empty_context(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+
+        def translate_one(text):
+            if '__BLANK__' in text:
+                return '__BLANK__\n'
+            if '__PLACEHOLDER__' in text:
+                return '__PLACEHOLDER__\n'
+            if text == 'volba\n':
+                return 'choice\n'
+            return '\n'
+
+        with self.assertRaisesRegex(FrausTranslationError, 'context recovery'):
+            transform.fallback(
+                'Český text <g id="fraus-option-choice">volba</g>\n',
+                '<g id="fraus-option-choice"><g id="nested">bad</g></g>\n',
+                translate_one,
+            )
+
+    def test_fraus_v2_fallback_accepts_unchanged_model_context(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+
+        def translate_one(text):
+            if '__BLANK__' in text:
+                return text
+            if text == 'volba\n':
+                return 'choice\n'
+            return text
+
+        result = transform.fallback(
+            'Český text <g id="fraus-option-choice">volba</g>\n',
+            '<g id="fraus-option-choice"><g id="nested">bad</g></g>\n',
+            translate_one,
+        )
+        self.assertEqual(
+            result,
+            'Český text <g id="fraus-option-choice">choice</g>\n',
+        )
+
+    def test_fraus_v2_context_recovery_retries_deleted_moved_or_changed_blank(self):
+        for damaged in ('Translated text with the answer\n',
+                        '__BLANK__Translated text\n',
+                        'Translated __ANSWER__\n'):
+            with self.subTest(damaged=damaged):
+                transform = FrausV2XmlTransform()
+                transform.variant_sequence = [['choice']]
+                calls = []
+
+                def translate_one(text):
+                    calls.append(text)
+                    if '__BLANK__' in text:
+                        return damaged
+                    self.assertEqual(text, 'Text before __PLACEHOLDER__\n')
+                    return 'Translated text __PLACEHOLDER__\n'
+
+                result = transform.fallback(
+                    'Text before <g id="fraus-option-choice">one</g>\n',
+                    '<g id="fraus-option-choice">accepted option</g>\n',
+                    translate_one,
+                )
+                self.assertEqual(calls, ['Text before __BLANK__\n',
+                                         'Text before __PLACEHOLDER__\n'])
+                self.assertEqual(result, 'Translated text '
+                                 '<g id="fraus-option-choice">accepted option</g>\n')
+
+    def test_fraus_v2_fallback_rejects_empty_or_markup_model_outputs(self):
+        for output in ('', ' \n', '<br/>\n', '<b>invented</b>\n'):
+            for stage in ('option', 'context'):
+                with self.subTest(output=output, stage=stage):
+                    transform = FrausV2XmlTransform()
+                    transform.variant_sequence = [['choice']]
+                    calls = []
+
+                    def translate_one(text):
+                        calls.append(text)
+                        return output
+
+                    source = '<g id="fraus-option-choice">one</g>\n'
+                    target = '<g id="fraus-option-choice"></g>\n'
+                    if stage == 'context':
+                        source = 'Before ' + source
+                        target = '<g id="fraus-option-choice">accepted</g>\n'
+                    with self.assertRaises(FrausTranslationError):
+                        transform.fallback(source, target, translate_one)
+                    self.assertEqual(calls, ['one\n' if stage == 'option'
+                                             else 'Before __BLANK__\n'])
+
+    def test_fraus_v2_context_recovery_tries_second_placeholder(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['first', 'second']]
+        calls = []
+
+        def translate_one(text):
+            calls.append(text)
+            if '__BLANK__' in text:
+                return '__BLANK__ target first __BLANK__ answer\n'
+            return '__PLACEHOLDER__ translated context __PLACEHOLDER__\n'
+
+        result = transform.fallback(
+            '<g id="fraus-option-first">one</g> first second '
+            '<g id="fraus-option-second">two</g>\n',
+            '<g id="fraus-option-first">uno</g><g id="fraus-option-second">dos</g>\n',
+            translate_one,
+        )
+
+        self.assertEqual(
+            result,
+            '<g id="fraus-option-first">uno</g> translated context '
+            '<g id="fraus-option-second">dos</g>\n',
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            transform.fallback_diagnostics[-1]['strategy'],
+            '__PLACEHOLDER__',
+        )
+
+    def test_fraus_v2_context_recovery_unescapes_model_entities(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+        result = transform.fallback(
+            'A &amp; B <g id="fraus-option-choice">one</g>\n',
+            '<g id="fraus-option-choice">uno</g>\n',
+            lambda text: 'C &amp; D __BLANK__\n',
+        )
+
+        self.assertEqual(result, 'C &amp; D <g id="fraus-option-choice">uno</g>\n')
+        self.assertEqual(ET.fromstring(f'<root>{result}</root>').text, 'C & D ')
+
+    def test_fraus_v2_context_recovery_uses_isolated_context(self):
+        calls = []
+
+        def translate_one(text):
+            calls.append(text)
+            if '__BLANK__' in text or '__PLACEHOLDER__' in text:
+                return 'marker was removed\n'
+            return 'unprotected target\n'
+
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['first', 'second']]
+        result = transform.fallback(
+            '<g id="fraus-option-first">one</g> source context '
+            '<g id="fraus-option-second">two</g>\n',
+            '<g id="fraus-option-first">uno</g><g id="fraus-option-second">dos</g>\n',
+            translate_one,
+        )
+
+        self.assertEqual(
+            result,
+            '<g id="fraus-option-first">uno</g> unprotected target '
+            '<g id="fraus-option-second">dos</g>\n',
+        )
+        self.assertEqual(calls, ['__BLANK__ source context __BLANK__\n',
+                                 '__PLACEHOLDER__ source context __PLACEHOLDER__\n',
+                                 'source context\n'])
+        self.assertEqual(
+            transform.fallback_diagnostics[-1]['strategy'], 'isolated_context'
+        )
+
+    def test_fraus_v2_context_recovery_caches_only_model_results(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['first'], ['second']]
+        source = (
+            'Before <g id="fraus-option-first">one</g> after.\n'
+            'Before <g id="fraus-option-second">two</g> after.\n'
+        )
+        translated = (
+            '<g id="fraus-option-first"><g id="nested">bad</g></g>\n'
+            '<g id="fraus-option-second"><g id="nested">bad</g></g>\n'
+        )
+        context_calls = []
+
+        def translate_one(text):
+            if '__BLANK__' in text:
+                context_calls.append(text)
+                return text.replace('Before', 'Target before').replace(
+                    'after.', 'target after.'
+                )
+            self.assertIn(text, ['one\n', 'two\n'])
+            return 'target option\n'
+
+        transform.fallback(source, translated, translate_one)
+
+        self.assertEqual(context_calls, ['Before __BLANK__ after.\n'])
+        types = [item['type'] for item in transform.fallback_diagnostics]
+        self.assertEqual(types.count('context_retry'), 1)
+        self.assertEqual(types.count('context_cache_hit'), 1)
+
+    def test_fraus_v2_fallback_maps_okapi_renumbered_markers(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+        transform.variant_marker_kinds = [['option']]
+        transform.variant_source_payloads = ['<g id="fraus-option-choice">choice</g> context']
+
+        def translate_one(text):
+            if '__BLANK__' in text:
+                return text.replace('context', 'target context')
+            return 'target choice\n'
+
+        result = transform.fallback(
+            '<g id="1">choice</g> context\n',
+            '<g id="1"><g id="2">bad</g></g>\n',
+            translate_one,
+        )
+
+        self.assertEqual(
+            result,
+            '<g id="1">target choice</g> target context\n',
+        )
+        self.assertEqual(transform.fallback_values['choice'], 'target choice')
+
+    def test_fraus_v2_fallback_rejects_multiline_marker_structure(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+        transform.variant_marker_kinds = [['text', 'option']]
+
+        with self.assertRaisesRegex(AssertionError, 'ambiguous'):
+            transform.fallback(
+                '<g id="1">First sentence.\nSecond sentence.</g>'
+                '<g id="2">choice</g>\n',
+                'translated\n',
+                lambda text: text,
+            )
+
+    def test_fraus_v2_fallback_validates_generated_option_ids(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['expected']]
+
+        with self.assertRaisesRegex(AssertionError, 'marker identity'):
+            transform.fallback(
+                '<g id="fraus-option-unexpected">one</g>\n',
+                '<g id="fraus-option-unexpected"><g id="bad">one</g></g>\n',
+                lambda text: text,
+            )
+
+    def test_fraus_v2_fallback_preserves_comments_during_recovery(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+
+        def translate_one(text):
+            if '__BLANK__' in text:
+                return text.replace('Before', 'Target before')
+            return 'target choice\n'
+
+        result = transform.fallback(
+            'Before<!--keep--><g id="fraus-option-choice">one</g>\n',
+            '<g id="fraus-option-choice"><g id="bad">one</g></g>\n',
+            translate_one,
+        )
+
+        self.assertEqual(
+            result,
+            'Target before<!--keep--><g id="fraus-option-choice">target choice</g>\n',
+        )
+
+    def test_fraus_v2_fallback_rejects_redistributed_marker_lines(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+        source = (
+            'Český úvod.\n'
+            '<g id="fraus-option-choice">volba</g>\n'
+        )
+
+        def translate_one(text):
+            self.fail('Line validation must precede isolated translation')
+
+        with self.assertRaisesRegex(AssertionError, 'line positions'):
+            transform.fallback(
+                source,
+                '<g id="fraus-option-choice">choice</g>\nEnglish introduction.\n',
+                translate_one,
+            )
+
+    def test_fraus_v2_fallback_rejects_shifted_non_variant_lines(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+        source = (
+            '<g id="fraus-option-choice">volba</g>\n'
+            'První řádek.\n'
+            'Druhý řádek.\n'
+            'Třetí řádek.\n'
+        )
+        def translate_one(text):
+            self.fail('Line validation must precede isolated translation')
+
+        with self.assertRaisesRegex(AssertionError, 'line positions'):
+            transform.fallback(
+                source,
+                'First line.\nSecond line.\nThird line.\n'
+                '<g id="fraus-option-choice">choice</g>\n',
+                translate_one,
+            )
+
+    def test_fraus_v2_fallback_rejects_total_line_changes(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+
+        def translate_one(text):
+            self.fail('Line validation must precede isolated translation')
+
+        with self.assertRaisesRegex(AssertionError, 'line structure'):
+            transform.fallback(
+                '<g id="fraus-option-choice">volba</g>\nČeský závěr.\n',
+                '<g id="fraus-option-choice">choice</g>\n',
+                translate_one,
+            )
+
+    def test_fraus_v2_fallback_preserves_crlf_line_endings(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+
+        def translate_one(text):
+            if '__BLANK__' in text:
+                return 'English context__BLANK__\n'
+            self.assertEqual(text, 'volba\n')
+            return 'choice\n'
+
+        result = transform.fallback(
+            'Český text <g id="fraus-option-choice">volba</g>\r\n',
+            '<g id="fraus-option-choice"><g id="nested">bad</g></g>\r\n',
+            translate_one,
+        )
+
+        self.assertEqual(
+            result,
+            'English context <g id="fraus-option-choice">choice</g>\r\n',
+        )
+
+    def test_fraus_v2_fallback_rejects_changed_crlf_line_count(self):
+        transform = FrausV2XmlTransform()
+        transform.variant_sequence = [['choice']]
+
+        def translate_one(text):
+            self.fail('Line validation must precede isolated translation')
+
+        with self.assertRaisesRegex(AssertionError, 'line structure'):
+            transform.fallback(
+                '<g id="fraus-option-choice">volba</g>\r\nČeský závěr.\r\n',
+                '<g id="fraus-option-choice">choice</g>\n',
+                translate_one,
+            )
 
     def test_fraus_v2_can_force_sentence_boundaries(self):
         transform = FrausV2XmlTransform(force_sentence_level=True)
@@ -821,6 +1402,8 @@ class PipelineTests(unittest.TestCase):
             with open(source, 'w', encoding='utf-8') as file:
                 file.write('<DOC><Questions><Question><RA><ExText Id="before">First sentence. Second sentence.</ExText><InputOption Id="input"><SelectOption><ExText>one</ExText></SelectOption></InputOption></RA></Question></Questions></DOC>')
             transform.preprocess(source, prepared)
+            prepared_text = open(prepared, encoding='utf-8').read()
+            self.assertNotIn('__FRAUS_VARIANT_', prepared_text)
             self.assertIn('\n', ET.parse(prepared).find('.//Questions//RA/ExText').text)
 
     def test_fraus_v2_uses_sentence_splitter_prefix_rules(self):
