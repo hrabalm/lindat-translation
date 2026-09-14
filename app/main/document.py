@@ -31,7 +31,8 @@ from app.settings import (
 from app.text_utils import count_words
 from app.text_utils import split_text_into_sentences
 from document_translation.lindat_services.align import LindatAligner
-from document_translation.markuptranslator import MarkupTranslator, Translator
+from document_translation.markuptranslator import Translator
+from app.main.markuptranslator import MarkupTranslator
 from document_translation.pdf_tools.pdfeditor import PdfEditor
 from document_translation.regextokenizer import RegexTokenizer
 
@@ -60,8 +61,20 @@ def unwrap_paragraph_preserve_markup(line: str) -> str:
     return stripped[3:-4] + "\n"
 
 
+# Delimiters belong to the opening tag's encoding layer; deeper entities are
+# attribute data. Raw quotes can remain at any layer when escaped with quote=False.
 _TAG_TOKEN_RE = re.compile(
-    r"(?:<|&lt;|&amp;lt;)\s*/?\s*[A-Za-z][\w:.-]*\b.*?(?:>|&gt;|&amp;gt;)",
+    "|".join(
+        rf"{opening}\s*/?\s*[A-Za-z][\w:.-]*\b"
+        rf"(?:=\s*(?P<quote_{layer}>{quotes})"
+        rf"(?:(?!(?P=quote_{layer})).)*(?P=quote_{layer})"
+        rf"|(?!(?:=\s*(?:{quotes})|{closing})).)*{closing}"
+        for layer, opening, closing, quotes in (
+            ("raw", "<", ">", r'''["']'''),
+            ("once", "&lt;", "&gt;", r'''["']|&(?:quot|apos|#(?:34|39|x22|x27));'''),
+            ("twice", "&amp;lt;", "&amp;gt;", r'''["']|&amp;(?:quot|apos|#(?:34|39|x22|x27));'''),
+        )
+    ),
     re.IGNORECASE | re.DOTALL,
 )
 _TAG_NAME_RE = re.compile(r"<\s*/?\s*([A-Za-z][\w:.-]*)", re.IGNORECASE)
@@ -76,7 +89,7 @@ def _tag_name(token: str) -> Optional[str]:
 def sanitize_generated_markup(source: str, target: str) -> str:
     """Remove generated tags whose names are absent from the source."""
     allowed = {
-        name for name in (_tag_name(token) for token in _TAG_TOKEN_RE.findall(source))
+        name for name in (_tag_name(match.group()) for match in _TAG_TOKEN_RE.finditer(source))
         if name is not None
     }
 
@@ -420,10 +433,15 @@ class FrausV2XmlTransform(XmlTransform):
         for child in list(restored):
             if child.tag == "ExText":
                 value = runs[run_index] if run_index < len(runs) else None
-                if value is not None and (value.strip() or not (child.text or "").strip()):
-                    child.text = value
-                elif (child.text or "").strip():
+                source_visible = html.unescape(html.unescape(_TAG_TOKEN_RE.sub(
+                    "", child.text or ""))).strip()
+                target_visible = html.unescape(html.unescape(_TAG_TOKEN_RE.sub(
+                    "", value or ""))).strip()
+                if source_visible and not target_visible:
                     raise FrausTranslationError("FRAUS context reconstruction has no usable translation")
+                # Layout-only runs belong to the source, not the translation.
+                if source_visible:
+                    child.text = value
                 new_children.append(child)
                 run_index += 1
             elif child.tag == "InputOption":
@@ -631,22 +649,51 @@ class FrausV2XmlTransform(XmlTransform):
     def _recover_unmapped_ra(self, record, translate_one, contextual_values, translations):
         # Extraction ownership is uncertain, but the original RA's XML positions
         # are not. Recover there without changing any unidentified output lines.
-        source = copy.deepcopy(record["original"])
-        for node in source.iter("ExText"):
-            node.text = _TAG_TOKEN_RE.sub("", html.unescape(node.text or ""))
-        source.set(f"{{{self.namespace}}}source-ra", record["source_id"])
-        temporary = FrausV2XmlTransform()
-        temporary._flatten_context(source, 0)
-        payload = source.find("ExText")
-        source_line = html.escape(payload.text or "", quote=False) + "".join(
-            ET.tostring(child, encoding="unicode") for child in payload)
-        option_ids = {marker.get("id") for marker in payload.iter("g")
-                      if marker.get("id", "").startswith("fraus-option-")}
+        formatting = {}
+
+        def context_markup(value):
+            pieces = []
+            cursor = 0
+            for match in _TAG_TOKEN_RE.finditer(value):
+                pieces.append(html.escape(html.unescape(value[cursor:match.start()]), quote=False))
+                marker = f'<g id="fraus-format-{len(formatting)}" />'
+                formatting[marker] = html.escape(match.group(), quote=False)
+                pieces.append(marker)
+                cursor = match.end()
+            pieces.append(html.escape(html.unescape(value[cursor:]), quote=False))
+            return "".join(pieces)
+
+        # Inert codes preserve even unbalanced HTML fragments across options.
+        # Only character data is presented to context translation.
+        pieces = []
+        option_ids = set()
+        previous = None
+        text_index = option_index = 0
+        for child in record["original"]:
+            if child.tag == "ExText":
+                value = context_markup(child.text or "")
+                if previous == "text":
+                    value = f'<g id="fraus-text-{text_index}">{value}</g>'
+                pieces.append(value)
+                text_index += 1
+                previous = "text"
+            elif child.tag == "InputOption":
+                selects = child.findall("SelectOption")
+                selected = self._selected(selects, 0)
+                marker_id = f"fraus-option-{record['source_id']}-{option_index}-{selects.index(selected)}"
+                option_ids.add(marker_id)
+                value = _TAG_TOKEN_RE.sub("", html.unescape(selected.findtext("ExText") or ""))
+                pieces.append(f'<g id="{marker_id}">{html.escape(value, quote=False)}</g>')
+                option_index += 1
+                previous = "option"
+        source_line = "".join(pieces)
         self.fallback_diagnostics.append({
             "type": "ambiguous_ra_recovery", "source_id": record["source_id"],
             "strategy": "original_xml_boundaries",
         })
         recovered = self._recover_context(source_line, translate_one, translations, None, option_ids)
+        for marker, token in formatting.items():
+            recovered = recovered.replace(marker, token)
         record["recovered_context"] = self._parse_fragment(recovered)
         for option_index, option in enumerate(record["original"].findall("InputOption")):
             for select_index, select in enumerate(option.findall("SelectOption")):

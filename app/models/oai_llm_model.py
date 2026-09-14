@@ -44,7 +44,7 @@ RETRYABLE_TRANSPORT_ERRORS = (
     httpx.RemoteProtocolError,
 )
 TOKEN_RE = re.compile(
-    r"<[^>]+>|[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]|[^\W_]+|[^\w\s]",
+    r"<[^>]+>|[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]|[^\W_]+|_+|[^\w\s]",
     re.UNICODE,
 )
 SENTENCE_ENDINGS = {'.', '!', '?', '。', '！', '？'}

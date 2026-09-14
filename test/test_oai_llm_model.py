@@ -375,6 +375,43 @@ class OaiLLMModelTests(unittest.TestCase):
         self.assertEqual(payload['temperature'], 0.2)
         self.assertEqual(result, ['line one line two'])
 
+    def test_translate_sends_underscores_to_model_and_preserves_chunk_formatting(self):
+        cases = [
+            ('_', {'_': '_'}, '_'),
+            ('____', {'____': '____'}, '____'),
+            ('____', {'____': 'model-result'}, 'model-result'),
+            (' \t____\r\n', {'____': '____'}, ' \t____\r\n'),
+            (
+                '_one____two_\n____\nthree _',
+                {'_': '_', '____': '____', 'one': 'ONE', 'two': 'TWO',
+                 'three': 'THREE'},
+                '_ONE____TWO_\n____\nTHREE _',
+            ),
+        ]
+        for source, responses, expected in cases:
+            with self.subTest(source=source, expected=expected):
+                prompts = []
+
+                async def handler(request):
+                    self.assertEqual(request.url.path, '/v1/chat/completions')
+                    prompt = json.loads(request.content)['messages'][0]['content']
+                    prompts.append(prompt)
+                    return httpx.Response(200, json={
+                        'choices': [{'message': {'content': responses[prompt]}}],
+                    })
+
+                model = self.make_model(
+                    handler, prompt='{sentence}', max_input_tokens=1,
+                )
+                result = model.translate(source, src='en', tgt='cs')
+
+                self.assertEqual(''.join(result), expected)
+                self.assertCountEqual(
+                    prompts,
+                    ['_', 'one', '____', 'two', '_', '____', 'three', '_']
+                    if 'one' in source else [source.strip()],
+                )
+
     def test_input_chunks_preserve_whitespace_when_reconstructed(self):
         async def handler(request):
             return httpx.Response(200, json={
