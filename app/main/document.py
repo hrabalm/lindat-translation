@@ -20,6 +20,7 @@ from app.main.api.translation.parsers import text_input_with_src_tgt
 from app.main.translate import translate_from_to, translate_with_model
 from app.main.translatable import Translatable
 from app.models.llm_errors import LLMBackendError
+from app.models.llm_request_state import suppress_few_shot
 from app.settings import (
     ALLOWED_EXTENSIONS,
     FRAUS_V2_FORCE_SENTENCE_LEVEL,
@@ -1295,6 +1296,8 @@ class InnerLindatTranslator(Translator):
         self.model = model
         self.split = split
         self.custom_prompt = custom_prompt
+        # Documents historically ignore term rendering; only suppress examples.
+        self.suppress_few_shot = bool(terms)
         self.debug_segments = []
         self.strict = strict
 
@@ -1319,17 +1322,18 @@ class InnerLindatTranslator(Translator):
         if num_suffix_newlines:
             input_text = input_text[:-num_suffix_newlines]
 
-        if self.method == "with_model":
-            src_sentences, tgt_sentences = translate_with_model(
-                self.model, input_text, self.src, self.tgt,
-                return_source_sentences=True, custom_prompt=self.custom_prompt,
-                split=split,
-            )
-        else:
-            src_sentences, tgt_sentences = translate_from_to(
-                self.src, self.tgt, input_text, return_source_sentences=True,
-                custom_prompt=self.custom_prompt, split=split,
-            )
+        with suppress_few_shot(self.suppress_few_shot):
+            if self.method == "with_model":
+                src_sentences, tgt_sentences = translate_with_model(
+                    self.model, input_text, self.src, self.tgt,
+                    return_source_sentences=True, custom_prompt=self.custom_prompt,
+                    split=split,
+                )
+            else:
+                src_sentences, tgt_sentences = translate_from_to(
+                    self.src, self.tgt, input_text, return_source_sentences=True,
+                    custom_prompt=self.custom_prompt, split=split,
+                )
 
         if self.strict:
             if state is not None:

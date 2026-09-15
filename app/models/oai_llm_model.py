@@ -1,5 +1,7 @@
 import asyncio
+from copy import deepcopy
 from email.utils import parsedate_to_datetime
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -30,6 +32,7 @@ from app.models.llm_errors import (
 from app.models.llm_request_state import (
     LLMRequestState,
     LLMSegmentRecord,
+    few_shot_suppressed,
     get_request_llm_state,
 )
 
@@ -119,6 +122,29 @@ class OaiLLMModel(models.Model):
         self.prompt = cfg.get('prompt', default_prompt)
         self.prompt_terms = cfg.get('prompt_terms', default_prompt_terms)
         self.allow_custom_prompt = cfg.get('allow_custom_prompt', True)
+        self.few_shot_attempts = deepcopy(cfg.get('few_shot_attempts', {}))
+        if not isinstance(self.few_shot_attempts, dict):
+            raise ValueError('few_shot_attempts must be a mapping')
+        directions = {
+            f'{src}-{tgt}' for src, targets in self.supports.items()
+            for tgt in targets
+        }
+        for direction, stages in self.few_shot_attempts.items():
+            if direction != 'all' and direction not in directions:
+                raise ValueError('few_shot_attempts has an unsupported direction key')
+            if not isinstance(stages, list) or not stages:
+                raise ValueError('few_shot_attempts stages must be a nonempty list')
+            for examples in stages:
+                if not isinstance(examples, list):
+                    raise ValueError('few_shot_attempts stage must be a list')
+                for example in examples:
+                    if (not isinstance(example, dict)
+                            or set(example) != {'source', 'target'}
+                            or any(not isinstance(value, str) or not value.strip()
+                                   for value in example.values())):
+                        raise ValueError(
+                            'few_shot_attempts examples require exactly source and target nonblank strings'
+                        )
         self.max_completion_tokens = cfg.get('max_completion_tokens', 512)
         self.temperature = cfg.get('temperature', 0.05)
         self.retry_attempts = cfg.get('retry_attempts', 3)
@@ -339,17 +365,66 @@ class OaiLLMModel(models.Model):
         prompt = self._format_prompt(
             segment.source, segment.index, src, tgt, custom_prompt, terms
         )
+        # Supplying an override opts out even when custom prompts are disabled.
+        stages = self.few_shot_attempts.get(
+            f'{src}-{tgt}', self.few_shot_attempts.get('all', [[]])
+        ) if not (custom_prompt or terms or few_shot_suppressed.get()) else [[]]
         try:
-            output = await self._translate_prompt(
-                client, semaphore, prompt, segment.label, batch_id
-            )
-            return LLMSegmentResult(output, [LLMSegmentRecord(
-                segment=segment.label,
-                estimated_tokens=self._estimated_text_tokens(segment.source),
-                translated=True,
-                depth=segment.depth,
-                batch_id=batch_id,
-            )])
+            for stage_index, examples in enumerate(stages):
+                messages = []
+                for example in examples:
+                    messages.extend([
+                        {'role': 'user', 'content': self._format_prompt(
+                            example['source'], segment.index, src, tgt, custom_prompt, terms
+                        )},
+                        {'role': 'assistant', 'content': example['target']},
+                    ])
+                messages.append({'role': 'user', 'content': prompt})
+                outcome = None
+                error_type = None
+                try:
+                    output = await self._translate_prompt(
+                        client, semaphore, messages, segment.label, batch_id
+                    )
+                    outcome = 'success'
+                    return LLMSegmentResult(output, [LLMSegmentRecord(
+                        segment=segment.label,
+                        estimated_tokens=self._estimated_text_tokens(segment.source),
+                        translated=True,
+                        depth=segment.depth,
+                        batch_id=batch_id,
+                    )])
+                except LLMCompletionTruncated:
+                    outcome = 'truncated'
+                    if stage_index == len(stages) - 1:
+                        raise
+                except LLMBackendError as error:
+                    outcome = 'failed'
+                    error_type = type(error).__name__
+                    raise
+                except asyncio.CancelledError as error:
+                    outcome = 'cancelled'
+                    error_type = type(error).__name__
+                    raise
+                finally:
+                    if outcome is not None:
+                        # Emit before resplitting/cancellation can discard parent results.
+                        diagnostic = {
+                            'batch_id': batch_id,
+                            'segment': segment.label,
+                            'depth': segment.depth,
+                            'stage_index': stage_index,
+                            'example_fingerprint': hashlib.sha256(json.dumps(
+                                examples, sort_keys=True, separators=(',', ':')
+                            ).encode('utf-8')).hexdigest(),
+                            'prior_truncations': stage_index,
+                            'outcome': outcome,
+                        }
+                        if error_type is not None:
+                            diagnostic['error'] = error_type
+                        log.info('LLM few-shot stage %s', json.dumps(diagnostic),
+                                 extra={'few_shot': diagnostic})
+            raise AssertionError('Validated few_shot_attempts must contain a stage')
         except LLMCompletionTruncated as error:
             split = self._resplit_segment(segment)
             if split is None:
@@ -426,7 +501,7 @@ class OaiLLMModel(models.Model):
         ]
         return children, formatting
 
-    async def _translate_prompt(self, client, semaphore, prompt, index,
+    async def _translate_prompt(self, client, semaphore, messages, index,
                                 batch_id):
         request_id = str(uuid.uuid4())
         retrying = AsyncRetrying(
@@ -459,7 +534,7 @@ class OaiLLMModel(models.Model):
                         )
                         response = await client.post(
                             "/chat/completions",
-                            json=self._request_body(prompt),
+                            json=self._request_body(messages),
                             headers={"X-Request-ID": request_id},
                         )
                         log.info(
@@ -504,11 +579,11 @@ class OaiLLMModel(models.Model):
             type(exception).__name__ if exception else "unknown",
         )
 
-    def _request_body(self, prompt):
+    def _request_body(self, messages):
         body = {
             "model": self.model if self.provider == "openai"
             else f"{self.provider}/{self.model}",
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": self.temperature,
             "stop": ["###"],
         }

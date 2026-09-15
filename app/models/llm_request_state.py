@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from flask import g, has_request_context
@@ -8,6 +10,19 @@ from app.models.llm_errors import (
     LLMBackendTimeout,
     LLMBackendUnavailable,
 )
+
+
+few_shot_suppressed = ContextVar('few_shot_suppressed', default=False)
+
+
+@contextmanager
+def suppress_few_shot(enabled: bool = True):
+    """Scope suppression to this call, including work submitted to the async runner."""
+    token = few_shot_suppressed.set(enabled or few_shot_suppressed.get())
+    try:
+        yield
+    finally:
+        few_shot_suppressed.reset(token)
 
 
 @dataclass
