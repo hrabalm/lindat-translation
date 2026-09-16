@@ -13,6 +13,140 @@ attributes:
   aria-label:
     ruleTypes: [ATTRIBUTE_TRANS]
 elements:
+  # Keep formulas inline and shield symbolic leaves, not mtext prose.
+  # Local preservation cannot undo whitespace collapsed by XML extraction.
+  math:
+    ruleTypes: [INLINE, PRESERVE_WHITESPACE]
+  mrow:
+    ruleTypes: [INLINE]
+  msub:
+    ruleTypes: [INLINE]
+  msup:
+    ruleTypes: [INLINE]
+  msubsup:
+    ruleTypes: [INLINE]
+  mfrac:
+    ruleTypes: [INLINE]
+  msqrt:
+    ruleTypes: [INLINE]
+  mroot:
+    ruleTypes: [INLINE]
+  munder:
+    ruleTypes: [INLINE]
+  mover:
+    ruleTypes: [INLINE]
+  munderover:
+    ruleTypes: [INLINE]
+  mfenced:
+    ruleTypes: [INLINE]
+  mtable:
+    ruleTypes: [INLINE]
+  mtr:
+    ruleTypes: [INLINE]
+  mtd:
+    ruleTypes: [INLINE]
+  semantics:
+    ruleTypes: [INLINE]
+  mi:
+    ruleTypes: [INLINE, EXCLUDE]
+  mn:
+    ruleTypes: [INLINE, EXCLUDE]
+  mo:
+    ruleTypes: [INLINE, EXCLUDE]
+  mtext:
+    ruleTypes: [INLINE]
+  annotation:
+    ruleTypes: [INLINE, EXCLUDE]
+  annotation-xml:
+    ruleTypes: [INLINE, EXCLUDE]
+  m:math:
+    ruleTypes: [INLINE, PRESERVE_WHITESPACE]
+  m:mrow:
+    ruleTypes: [INLINE]
+  m:msub:
+    ruleTypes: [INLINE]
+  m:msup:
+    ruleTypes: [INLINE]
+  m:msubsup:
+    ruleTypes: [INLINE]
+  m:mfrac:
+    ruleTypes: [INLINE]
+  m:msqrt:
+    ruleTypes: [INLINE]
+  m:mroot:
+    ruleTypes: [INLINE]
+  m:munder:
+    ruleTypes: [INLINE]
+  m:mover:
+    ruleTypes: [INLINE]
+  m:munderover:
+    ruleTypes: [INLINE]
+  m:mfenced:
+    ruleTypes: [INLINE]
+  m:mtable:
+    ruleTypes: [INLINE]
+  m:mtr:
+    ruleTypes: [INLINE]
+  m:mtd:
+    ruleTypes: [INLINE]
+  m:semantics:
+    ruleTypes: [INLINE]
+  m:mi:
+    ruleTypes: [INLINE, EXCLUDE]
+  m:mn:
+    ruleTypes: [INLINE, EXCLUDE]
+  m:mo:
+    ruleTypes: [INLINE, EXCLUDE]
+  m:mtext:
+    ruleTypes: [INLINE]
+  m:annotation:
+    ruleTypes: [INLINE, EXCLUDE]
+  m:annotation-xml:
+    ruleTypes: [INLINE, EXCLUDE]
+  mml:math:
+    ruleTypes: [INLINE, PRESERVE_WHITESPACE]
+  mml:mrow:
+    ruleTypes: [INLINE]
+  mml:msub:
+    ruleTypes: [INLINE]
+  mml:msup:
+    ruleTypes: [INLINE]
+  mml:msubsup:
+    ruleTypes: [INLINE]
+  mml:mfrac:
+    ruleTypes: [INLINE]
+  mml:msqrt:
+    ruleTypes: [INLINE]
+  mml:mroot:
+    ruleTypes: [INLINE]
+  mml:munder:
+    ruleTypes: [INLINE]
+  mml:mover:
+    ruleTypes: [INLINE]
+  mml:munderover:
+    ruleTypes: [INLINE]
+  mml:mfenced:
+    ruleTypes: [INLINE]
+  mml:mtable:
+    ruleTypes: [INLINE]
+  mml:mtr:
+    ruleTypes: [INLINE]
+  mml:mtd:
+    ruleTypes: [INLINE]
+  mml:semantics:
+    ruleTypes: [INLINE]
+  mml:mi:
+    ruleTypes: [INLINE, EXCLUDE]
+  mml:mn:
+    ruleTypes: [INLINE, EXCLUDE]
+  mml:mo:
+    ruleTypes: [INLINE, EXCLUDE]
+  mml:mtext:
+    ruleTypes: [INLINE]
+  mml:annotation:
+    ruleTypes: [INLINE, EXCLUDE]
+  mml:annotation-xml:
+    ruleTypes: [INLINE, EXCLUDE]
   g:
     ruleTypes: [INLINE]
   meta:
