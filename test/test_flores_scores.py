@@ -112,6 +112,97 @@ class FloresScoreTests(unittest.TestCase):
             json.dumps({**job, "resume_fingerprint": self.manifest["resume_fingerprint"], "eval_id": "wrong"}))
         self.assertNotEqual(self.run_score().returncode, 0)
 
+    def test_mixed_execution_strata_preserve_corpus_quality_and_signatures(self):
+        baseline = score_flores.score_run(self.root, bootstrap_samples=40)
+        self.manifest["generation"] = {"batch_size": 256, "concurrency": 256}
+        self.manifest["timeouts"] = {"call_seconds": 900}
+        for index, job in enumerate(self.manifest["jobs"]):
+            extra = {"execution_concurrency": 256, "execution_call_timeout": 900,
+                     "duration_seconds": 10 + index}
+            if index == 0:
+                extra = {"execution_concurrency": 1, "execution_call_timeout": 120,
+                         "measurement_epoch": "sequential", "duration_seconds": 2,
+                         "imported_from": {"source_resume_fingerprint": "PRIVATE OLD FINGERPRINT",
+                                           "source_record_sha256": "PRIVATE HASH"}}
+            self.write_record(job, "success", "The small cat sat on the warm mat .", **extra)
+        self.write_manifest()
+        result = self.run_score("--bootstrap-samples", "40")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report, path = self.report()
+        policy = report["execution_policy"]
+        self.assertTrue(policy["mixed"])
+        self.assertEqual(policy["imported_count"], 1)
+        self.assertEqual([s["record_count"] for s in policy["strata"]], [1, 8])
+        arms = report["targets"]["en"]["conditions"]
+        strata = arms["0"]["execution_policy"]["strata"]
+        self.assertEqual([s["execution_concurrency"] for s in strata], [1, 256])
+        self.assertEqual([s["execution_call_timeout"] for s in strata], [120, 900])
+        self.assertEqual([s["record_count"] for s in strata], [1, 2])
+        self.assertEqual([s["duration_seconds"]["count"] for s in strata], [1, 2])
+        self.assertEqual([s["duration_seconds"]["p50"] for s in strata], [2, 11])
+        self.assertEqual([s["duration_seconds"]["p99"] for s in strata], [2, 12])
+        self.assertEqual(arms["0"]["duration_seconds"]["count"], 3)
+        for shots, arm in arms.items():
+            self.assertEqual(arm["metrics"], baseline["targets"]["en"]["conditions"][shots]["metrics"])
+            self.assertEqual(arm["completed"], 3)
+        self.assertEqual(report["targets"]["en"]["comparisons"], baseline["targets"]["en"]["comparisons"])
+        self.assertFalse(arms["5"]["execution_policy"]["mixed"])
+        self.assertIn("not a comparable performance measurement", path.with_suffix(".md").read_text())
+        self.assertNotIn("PRIVATE", path.read_text())
+
+    def test_legacy_execution_fallbacks_and_record_override(self):
+        for generation, expected in (({}, 1), ({"batch_size": 32}, 32),
+                                     ({"batch_size": 1, "concurrency": 512}, 512)):
+            with self.subTest(generation=generation):
+                self.manifest["generation"] = generation
+                self.write_manifest()
+                before = {p: p.read_bytes() for p in self.root.rglob("*.json")}
+                policy = score_flores.score_run(self.root, 0)["execution_policy"]
+                self.assertEqual(policy["strata"][0]["execution_concurrency"], expected)
+                self.assertEqual(policy["strata"][0]["record_count"], 9)
+                self.assertEqual(policy["imported_count"], 0)
+                self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.write_record(self.manifest["jobs"][0], "success", "The small cat sat on the warm mat .",
+                          execution_concurrency=1, imported_from={}, duration_seconds=None)
+        self.manifest["timeouts"] = {"call_seconds": 900}
+        self.write_manifest()
+        strata = score_flores.score_run(self.root, 0)["execution_policy"]["strata"]
+        self.assertEqual(strata[0]["execution_concurrency"], 1)
+        self.assertIsNone(strata[0]["execution_call_timeout"])
+        self.assertEqual(strata[0]["duration_seconds"]["missing"], 1)
+        self.assertIsNone(strata[0]["duration_seconds"]["p95"])
+        self.assertEqual(strata[1]["execution_call_timeout"], 900)
+
+    def test_timeout_changes_split_same_concurrency(self):
+        for job, timeout in zip(self.manifest["jobs"][:3], (120, 900, None)):
+            self.write_record(job, "success", "The small cat sat on the warm mat .",
+                              execution_concurrency=256, execution_call_timeout=timeout)
+        arm = score_flores.score_run(self.root, 0)["targets"]["en"]["conditions"]["0"]
+        self.assertTrue(arm["execution_policy"]["mixed"])
+        strata = arm["execution_policy"]["strata"]
+        self.assertEqual([s["execution_call_timeout"] for s in strata], [None, 120, 900])
+        self.assertEqual([s["record_count"] for s in strata], [1, 1, 1])
+
+    def test_invalid_execution_metadata_is_rejected(self):
+        job = self.manifest["jobs"][0]
+        for value in (-1, 0, True, False, 513, 1.5, "256", None):
+            with self.subTest(concurrency=value):
+                self.write_record(job, "success", "valid output", execution_concurrency=value)
+                with self.assertRaisesRegex(ValueError, "invalid execution concurrency"):
+                    score_flores.score_run(self.root, 0)
+                self.write_record(job, "success", "valid output")
+                self.manifest["generation"] = {"batch_size": value}
+                self.write_manifest()
+                with self.assertRaisesRegex(ValueError, "invalid execution concurrency"):
+                    score_flores.score_run(self.root, 0)
+                self.manifest.pop("generation")
+                self.write_manifest()
+        for value in (-1, 0, True, 3601, float("nan"), float("inf"), "900"):
+            with self.subTest(timeout=value):
+                self.write_record(job, "success", "valid output", execution_call_timeout=value)
+                with self.assertRaisesRegex(ValueError, "invalid execution call timeout"):
+                    score_flores.score_run(self.root, 0)
+
     def test_paired_bootstrap_is_seeded_and_equal_scores_are_not_significant(self):
         result = self.run_score("--bootstrap-samples", "200")
         self.assertEqual(result.returncode, 0, result.stderr)

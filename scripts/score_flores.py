@@ -49,6 +49,32 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
 
 
+def duration_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    durations = sorted(row["duration_seconds"] for row in rows if row.get("duration_seconds") is not None)
+    return {"count": len(durations), "missing": len(rows) - len(durations),
+            "method": "nearest rank", **{
+                f"p{p}": durations[math.ceil(p / 100 * len(durations)) - 1] if durations else None
+                for p in (50, 90, 95, 99)}}
+
+
+def execution_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: dict[tuple[int, float | None], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (row["execution_concurrency"], row["execution_call_timeout"])
+        groups.setdefault(key, []).append(row)
+    return {
+        "mixed": len(groups) > 1,
+        "imported_count": sum("imported_from" in row for row in rows),
+        "strata": [
+            {"execution_concurrency": concurrency, "execution_call_timeout": timeout,
+             "record_count": len(group),
+             "imported_count": sum("imported_from" in row for row in group),
+             "duration_seconds": duration_summary(group)}
+            for (concurrency, timeout), group in sorted(
+                groups.items(), key=lambda item: (item[0][0], -1 if item[0][1] is None else item[0][1]))],
+    }
+
+
 def score_run(run_dir: Path, bootstrap_samples: int = 1000, seed: int = 1729) -> dict[str, Any]:
     """Validate complete paired coverage before computing any scores."""
     import sacrebleu
@@ -138,6 +164,19 @@ def score_run(run_dir: Path, bootstrap_samples: int = 1000, seed: int = 1729) ->
         if duration is not None and (type(duration) not in (int, float)
                                      or not math.isfinite(duration) or duration < 0):
             raise ValueError("invalid duration")
+        generation = manifest.get("generation", {})
+        concurrency = record.get("execution_concurrency", generation.get(
+            "concurrency", generation.get("batch_size", 1)))
+        if type(concurrency) is not int or not 1 <= concurrency <= 512:
+            raise ValueError("invalid execution concurrency")
+        # Imported timings belong to the source policy, never the destination timeout.
+        timeout = record.get("execution_call_timeout", None if "imported_from" in record
+                             else manifest.get("timeouts", {}).get("call_seconds"))
+        if timeout is not None and (type(timeout) not in (int, float)
+                                    or not math.isfinite(timeout) or not 0 < timeout <= 3600):
+            raise ValueError("invalid execution call timeout")
+        record["execution_concurrency"] = concurrency
+        record["execution_call_timeout"] = timeout
         records[identity] = record
 
     def metrics():
@@ -151,6 +190,12 @@ def score_run(run_dir: Path, bootstrap_samples: int = 1000, seed: int = 1729) ->
         "manifest_sha256": hashlib.sha256((run_dir / "manifest.json").read_bytes()).hexdigest(),
         "pilot": len(evaluation) < 1012, "evaluation_count": len(evaluation),
         "failure_policy": "all non-success records scored as blank hypotheses; no rows dropped",
+        "execution_policy": execution_summary(list(records.values())),
+        "latency_note": "Latency is stratified by execution concurrency and call timeout (null means unknown). "
+                        "Mixed-policy aggregate latency is descriptive only, not a comparable performance measurement; "
+                        "do not compare serial and parallel timings as equivalent. Concurrency is the configured limit, not observed occupancy.",
+        "quality_note": "Corpus quality includes imported and current records over identical evaluation IDs in every arm; "
+                        "execution strata do not filter quality scores or paired tests.",
         "bootstrap": {"samples": bootstrap_samples, "seed": seed,
                       "method": "SacreBLEU paired sentence bootstrap" if bootstrap_samples else "disabled",
                       "multiplicity": "Holm across all target/metric/pair tests in this report",
@@ -167,7 +212,6 @@ def score_run(run_dir: Path, bootstrap_samples: int = 1000, seed: int = 1729) ->
             rows = [records[(target, shots, identifier)] for identifier in ids]
             hypotheses[shots] = [row["output"] if row["status"] == "success" else "" for row in rows]
             counts = Counter(row["status"] for row in rows)
-            durations = sorted(row["duration_seconds"] for row in rows if row.get("duration_seconds") is not None)
             scored = {}
             for name, metric in metrics().items():
                 score = metric.corpus_score(hypotheses[shots], references)
@@ -178,10 +222,8 @@ def score_run(run_dir: Path, bootstrap_samples: int = 1000, seed: int = 1729) ->
                 "success_coverage": counts["success"] / len(ids),
                 "blank_hypotheses": len(ids) - counts["success"],
                 "truncation_rate": counts["truncated"] / len(ids),
-                "duration_seconds": {"count": len(durations), "missing": len(ids) - len(durations),
-                                     "method": "nearest rank", **{
-                                         f"p{p}": durations[math.ceil(p / 100 * len(durations)) - 1] if durations else None
-                                         for p in (50, 90, 95, 99)}},
+                "duration_seconds": duration_summary(rows),
+                "execution_policy": execution_summary(rows),
             }
         comparisons = []
         for baseline, candidate in ((0, 5), (0, 10), (5, 10)):
@@ -248,7 +290,10 @@ def main() -> int:
         report["created_at"] = datetime.now(timezone.utc).isoformat()
         markdown = ["# FLORES+ Scores", "", f"SacreBLEU: {report['sacrebleu_version']}",
                     f"Evaluation rows per arm: {report['evaluation_count']}; pilot: {report['pilot']}",
-                    "", report["failure_policy"], "", "| Target | Shots | BLEU | chrF++ | Success | Truncation |",
+                    "", report["failure_policy"], "", report["latency_note"], "", report["quality_note"],
+                    f"Mixed execution policies: {report['execution_policy']['mixed']}; "
+                    f"imported records: {report['execution_policy']['imported_count']}",
+                    "", "| Target | Shots | BLEU | chrF++ | Success | Truncation |",
                     "| --- | ---: | ---: | ---: | ---: | ---: |"]
         for target, value in report["targets"].items():
             for shots, arm in value["conditions"].items():
