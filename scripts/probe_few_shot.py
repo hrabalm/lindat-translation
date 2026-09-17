@@ -52,7 +52,7 @@ async def trial(model, source, target, examples, timeout, artifact=None, offline
     calls = 0
     observed: dict[str, object] = {
         'correctness': 'pending_human_review', 'termination': 'not_observed'}
-    baseline = model._request_body('probe')
+    baseline = model._request_body('probe', max_completion_tokens=model.completion_token_limit(source))
     baseline.pop('messages')
 
     async def request_hook(request):
@@ -63,6 +63,7 @@ async def trial(model, source, target, examples, timeout, artifact=None, offline
             raise RuntimeError('Request contract mismatch or extra request blocked')
         calls += 1
         observed['request_id'] = request.headers.get('X-Request-ID')
+        observed['effective_completion_tokens'] = body.get('max_tokens')
         observed['generation'] = {key: body.get(key) for key in (
             'model', 'temperature', 'stop', 'max_tokens', 'max_completion_tokens')}
 

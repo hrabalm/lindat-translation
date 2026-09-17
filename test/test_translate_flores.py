@@ -76,6 +76,55 @@ class FloresRunnerTests(unittest.TestCase):
         self.assertEqual(self.payloads, [])
         self.assertFalse((self.root / 'run').exists())
 
+    def test_adaptive_caps_are_source_only_and_isolated_across_concurrent_arms(self):
+        configs = json.loads(self.config.read_text())
+        configs[0]['adaptive_completion_budget'] = {}
+        configs[0]['max_completion_tokens'] = 512
+        self.config.write_text(json.dumps(configs))
+        path = self.root / 'devtest/ces_Latn.jsonl'
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        sources = ['x', 'word ' * 150]
+        for row, source in zip(rows, sources):
+            row['text'] = source
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.assertEqual(self.invoke('--limit', '2')[0], 0)
+        self.assertEqual(self.payloads, [])
+        self.assertFalse((self.root / 'run').exists())
+        active = peak = 0
+
+        async def handle(transport, request):
+            nonlocal active, peak
+            body = json.loads(request.content)
+            self.payloads.append(body)
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.02 if body['max_tokens'] == 64 else 0.001)
+                return httpx.Response(200, json={'choices': [dict(
+                    finish_reason='stop', message={'content': 'translation'})]})
+            finally:
+                active -= 1
+
+        with patch.object(httpx.AsyncHTTPTransport, 'handle_async_request', handle):
+            self.assertEqual(self.execute('--limit', '2', '--max-requests', '6',
+                                          '--concurrency', '6')[0], 0)
+        self.assertEqual((peak, active), (6, 0))
+        self.assertEqual(len(self.payloads), 6)
+        for source, cap in zip(sources, (64, 512)):
+            payloads = [p for p in self.payloads if p['messages'][-1]['content'] == source]
+            self.assertEqual({len(p['messages']) for p in payloads}, {1, 11, 21})
+            self.assertEqual([p['max_tokens'] for p in payloads], [cap] * 3)
+        for path in (self.root / 'run/records').glob('*.json'):
+            record = json.loads(path.read_text())
+            self.assertEqual(record['status'], 'success')
+            self.assertEqual(record['http_requests'], 1)
+            self.assertEqual(record['effective_completion_tokens'],
+                             64 if record['eval_id'] == '0000' else 512)
+        manifest = json.loads((self.root / 'run/manifest.json').read_text())
+        self.assertEqual(manifest['models']['en']['generation']['adaptive_budget'], dict(
+            min_tokens=64, tokens_per_input_token=4, extra_tokens=32))
+        self.assertNotIn('private-token', json.dumps(manifest))
+
     def test_prepare_only_is_offline_and_resumes_with_identical_manifest(self):
         blocked = AssertionError('Preparation must not initialize networking')
         with patch('socket.socket', side_effect=blocked), \

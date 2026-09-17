@@ -17,6 +17,33 @@ from scripts.probe_few_shot import CORPUS, ROOT, experiment, trial, write_new
 
 
 class FewShotProbeTests(unittest.TestCase):
+    def test_adaptive_cap_survives_preflight_and_few_shot_prompt_growth(self):
+        for shots in (0, 5):
+            examples = [{'source': 'long example ' * 40, 'target': 'translation'}] * shots
+            model = OaiLLMModel({
+                'source': ['cs'], 'target': ['de'], 'model': 'public-model',
+                'provider': 'openai', 'server': 'https://offline.invalid',
+                'prompt': 'PRIVATE instruction ' * 40 + '{sentence}',
+                'adaptive_completion_budget': {}, 'max_completion_tokens': 512,
+                'few_shot_attempts': {'cs-de': [examples]},
+                'retry_attempts': 1, 'max_resplit_depth': 0,
+            })
+            for offline in (True, False):
+                with self.subTest(shots=shots, offline=offline):
+                    model._create_client = lambda server: httpx.AsyncClient(
+                        base_url=server, transport=httpx.MockTransport(lambda request:
+                            httpx.Response(200, json={'choices': [{
+                                'finish_reason': 'stop', 'message': {'content': 'translated'}}]})))
+                    with Flask('offline-test').app_context():
+                        observed = asyncio.run(trial(model, 'x', 'de', examples, 1, offline=offline))
+                    self.assertEqual(observed['http_requests'], 1)
+                    self.assertTrue(observed['app_translated'])
+                    self.assertEqual(observed['effective_completion_tokens'], 64)
+                    generation = observed['generation']
+                    assert isinstance(generation, dict)
+                    self.assertEqual(generation['max_tokens'], 64)
+                    self.assertNotIn('PRIVATE', json.dumps(observed))
+
     def test_cli_requires_execute_without_loading_config(self):
         result = subprocess.run([
             sys.executable, str(ROOT / 'scripts/probe_few_shot.py'),

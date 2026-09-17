@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 from copy import deepcopy
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from dataclasses import dataclass
 import re
@@ -146,6 +149,25 @@ class OaiLLMModel(models.Model):
                             'few_shot_attempts examples require exactly source and target nonblank strings'
                         )
         self.max_completion_tokens = cfg.get('max_completion_tokens', 512)
+        # Only absence disables the budget; an explicit null is invalid.
+        self.adaptive_completion_budget = None
+        if 'adaptive_completion_budget' in cfg:
+            budget = cfg['adaptive_completion_budget']
+            defaults = {'min_tokens': 64, 'tokens_per_input_token': 4, 'extra_tokens': 32}
+            if not isinstance(budget, dict) or set(budget) - set(defaults):
+                raise ValueError('adaptive_completion_budget must be an object with only known keys')
+            budget = {**defaults, **budget}
+            for key, minimum in [('min_tokens', 1), ('extra_tokens', 0)]:
+                if type(budget[key]) is not int or budget[key] < minimum:
+                    raise ValueError(f'adaptive_completion_budget.{key} must be an integer >= {minimum}')
+            multiplier = budget['tokens_per_input_token']
+            if (type(multiplier) not in (int, float) or multiplier <= 0
+                    or (isinstance(multiplier, float) and not math.isfinite(multiplier))):
+                raise ValueError('adaptive_completion_budget.tokens_per_input_token must be finite and positive')
+            if self.max_completion_tokens is not None and (
+                    type(self.max_completion_tokens) is not int or self.max_completion_tokens <= 0):
+                raise ValueError('max_completion_tokens must be a positive integer or None with adaptive_completion_budget')
+            self.adaptive_completion_budget = budget
         self.temperature = cfg.get('temperature', 0.05)
         self.retry_attempts = cfg.get('retry_attempts', 3)
         self.retry_wait_min = cfg.get('retry_wait_min', 1)
@@ -160,6 +182,28 @@ class OaiLLMModel(models.Model):
         if self.max_resplit_depth < 0:
             raise ValueError("max_resplit_depth must not be negative")
         self._runtime_key = object()
+
+    def completion_token_limit(self, source: str) -> int | None:
+        """Return the source-only completion cap, or the legacy global cap."""
+        bound = self._adaptive_completion_bound(self._estimated_text_tokens(source))
+        if bound is None:
+            return self.max_completion_tokens
+        return bound if self.max_completion_tokens is None else min(
+            self.max_completion_tokens, bound
+        )
+
+    def _adaptive_completion_bound(self, estimated_input_tokens):
+        budget = self.adaptive_completion_budget
+        if budget is None:
+            return None
+        multiplier = budget['tokens_per_input_token']
+        if isinstance(multiplier, int):
+            scaled_tokens = multiplier * estimated_input_tokens
+        else:
+            # Ceil the exact stored float ratio without overflowing or rounding down.
+            numerator, denominator = multiplier.as_integer_ratio()
+            scaled_tokens = (numerator * estimated_input_tokens + denominator - 1) // denominator
+        return max(budget['min_tokens'], scaled_tokens + budget['extra_tokens'])
 
     @property
     def batch_size(self):
@@ -362,6 +406,9 @@ class OaiLLMModel(models.Model):
 
     async def _translate_segment(self, client, semaphore, segment, batch_id,
                                  src, tgt, custom_prompt, terms):
+        completion_limit = self.completion_token_limit(segment.source)
+        estimated_input_tokens = self._estimated_text_tokens(segment.source)
+        adaptive_bound = self._adaptive_completion_bound(estimated_input_tokens)
         prompt = self._format_prompt(
             segment.source, segment.index, src, tgt, custom_prompt, terms
         )
@@ -384,12 +431,15 @@ class OaiLLMModel(models.Model):
                 error_type = None
                 try:
                     output = await self._translate_prompt(
-                        client, semaphore, messages, segment.label, batch_id
+                        client, semaphore, messages, segment.label, batch_id,
+                        max_completion_tokens=completion_limit,
+                        estimated_input_tokens=estimated_input_tokens,
+                        adaptive_completion_bound=adaptive_bound,
                     )
                     outcome = 'success'
                     return LLMSegmentResult(output, [LLMSegmentRecord(
                         segment=segment.label,
-                        estimated_tokens=self._estimated_text_tokens(segment.source),
+                        estimated_tokens=estimated_input_tokens,
                         translated=True,
                         depth=segment.depth,
                         batch_id=batch_id,
@@ -420,6 +470,12 @@ class OaiLLMModel(models.Model):
                             'prior_truncations': stage_index,
                             'outcome': outcome,
                         }
+                        if adaptive_bound is not None:
+                            diagnostic.update({
+                                'estimated_input_tokens': estimated_input_tokens,
+                                'adaptive_completion_bound': adaptive_bound,
+                                'effective_completion_tokens': completion_limit,
+                            })
                         if error_type is not None:
                             diagnostic['error'] = error_type
                         log.info('LLM few-shot stage %s', json.dumps(diagnostic),
@@ -502,8 +558,10 @@ class OaiLLMModel(models.Model):
         return children, formatting
 
     async def _translate_prompt(self, client, semaphore, messages, index,
-                                batch_id):
+                                batch_id, *, max_completion_tokens=None,
+                                estimated_input_tokens=None, adaptive_completion_bound=None):
         request_id = str(uuid.uuid4())
+        body = self._request_body(messages, max_completion_tokens=max_completion_tokens)
         retrying = AsyncRetrying(
             retry=retry_if_exception_type(
                 RETRYABLE_TRANSPORT_ERRORS + (RetryableHTTPStatus,)
@@ -525,16 +583,19 @@ class OaiLLMModel(models.Model):
                         attempt_number = attempt.retry_state.attempt_number
                         started = time.monotonic()
                         log.info(
-                            "LLM request started batch_id=%s request_id=%s model=%s segment=%s attempt=%s",
+                            "LLM request started batch_id=%s request_id=%s model=%s segment=%s attempt=%s estimated_input_tokens=%s adaptive_completion_bound=%s effective_completion_tokens=%s",
                             batch_id,
                             request_id,
                             self.model,
                             index,
                             attempt_number,
+                            estimated_input_tokens,
+                            adaptive_completion_bound,
+                            body.get('max_tokens'),
                         )
                         response = await client.post(
                             "/chat/completions",
-                            json=self._request_body(messages),
+                            json=body,
                             headers={"X-Request-ID": request_id},
                         )
                         log.info(
@@ -579,7 +640,8 @@ class OaiLLMModel(models.Model):
             type(exception).__name__ if exception else "unknown",
         )
 
-    def _request_body(self, messages):
+    def _request_body(self, messages, *, max_completion_tokens=None):
+        """Use a per-call cap when supplied; None retains the global setting."""
         body = {
             "model": self.model if self.provider == "openai"
             else f"{self.provider}/{self.model}",
@@ -587,8 +649,10 @@ class OaiLLMModel(models.Model):
             "temperature": self.temperature,
             "stop": ["###"],
         }
-        if self.max_completion_tokens is not None:
-            body["max_tokens"] = self.max_completion_tokens
+        if max_completion_tokens is None:
+            max_completion_tokens = self.max_completion_tokens
+        if max_completion_tokens is not None:
+            body["max_tokens"] = max_completion_tokens
         return body
 
     @staticmethod

@@ -213,6 +213,7 @@ def execute(args, app, selected, manifest):
                 raise RuntimeError('Extra request or altered benchmark input blocked')
             state['calls'] += 1
             state['record']['request_id'] = request.headers.get('x-request-id')
+            state['record']['effective_completion_tokens'] = body.get('max_tokens')
 
         async def response_hook(response):
             record = active.get()['record']
@@ -265,7 +266,7 @@ def execute(args, app, selected, manifest):
                     source, 0, 'cs', target, None, None)})
                 if len(messages) != 2 * shots + 1:
                     raise ValueError('Message count mismatch')
-                body = model._request_body(messages)
+                body = model._request_body(messages, max_completion_tokens=model.completion_token_limit(source))
                 body.pop('messages')
                 record: dict = dict(job, status='error', output=None, finish_reason=None,
                                 resume_fingerprint=manifest['resume_fingerprint'],
@@ -451,6 +452,10 @@ def main(argv=None):
                 generation=dict(temperature=model.temperature,
                     max_completion_tokens=model.max_completion_tokens, stop=['###'],
                     prompt_hash=fingerprint(model.prompt), provider=model.provider))
+            if model.adaptive_completion_budget is not None:
+                models[target]['generation']['adaptive_budget'] = {
+                    key: model.adaptive_completion_budget[key] for key in (
+                        'min_tokens', 'tokens_per_input_token', 'extra_tokens')}
         jobs = [dict(job_id=f'{target}-{index}-{shots}', target=target,
                      shots=shots, eval_id=row['id'])
                 for target in args.targets for index, row in enumerate(dataset['evaluation'])
