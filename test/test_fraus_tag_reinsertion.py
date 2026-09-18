@@ -61,10 +61,8 @@ class FrausTagReinsertionTests(unittest.TestCase):
     def test_empty_pair_and_self_closing_tag_survive(self):
         for source in ('<g id="1"></g>', '<x id="1"/>'):
             with self.subTest(source=source):
-                # Document serializes an empty g as <g ... />, which upstream
-                # treats as an unclosed pair; existing structural recovery retains it.
                 result = ET.fromstring('<root>' + self.translate_document(
-                    source, expected_recovery=source.startswith('<g')) + '</root>')
+                    source, expected_recovery=False) + '</root>')
                 self.assertEqual([(node.tag, node.attrib) for node in result.iter()],
                                  [('root', {}), (source[1:2], {'id': '1'})])
                 self.assertFalse(''.join(result.itertext()).strip())

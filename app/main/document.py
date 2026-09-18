@@ -64,12 +64,15 @@ def unwrap_paragraph_preserve_markup(line: str) -> str:
 
 # Delimiters belong to the opening tag's encoding layer; deeper entities are
 # attribute data. Raw quotes can remain at any layer when escaped with quote=False.
+# Require tag/attribute boundaries so comparisons cannot swallow a later real tag.
 _TAG_TOKEN_RE = re.compile(
     "|".join(
-        rf"{opening}\s*/?\s*[A-Za-z][\w:.-]*\b"
-        rf"(?:=\s*(?P<quote_{layer}>{quotes})"
+        rf"{opening}/?[A-Za-z][\w:.-]*"
+        rf"(?:\s+(?:(?!{opening}|{closing}|{quotes})[^\s/<>\"'=\x00-\x1f\x7f-\x9f])+"
+        rf"(?:\s*=\s*(?:"
+        rf"(?P<quote_{layer}>{quotes})"
         rf"(?:(?!(?P=quote_{layer})).)*(?P=quote_{layer})"
-        rf"|(?!(?:=\s*(?:{quotes})|{closing})).)*{closing}"
+        rf"|(?:(?!{opening}|{closing}|{quotes})[^\s<>\"'`=])+))?)*\s*/?{closing}"
         for layer, opening, closing, quotes in (
             ("raw", "<", ">", r'''["']'''),
             ("once", "&lt;", "&gt;", r'''["']|&(?:quot|apos|#(?:34|39|x22|x27));'''),
@@ -78,7 +81,7 @@ _TAG_TOKEN_RE = re.compile(
     ),
     re.IGNORECASE | re.DOTALL,
 )
-_TAG_NAME_RE = re.compile(r"<\s*/?\s*([A-Za-z][\w:.-]*)", re.IGNORECASE)
+_TAG_NAME_RE = re.compile(r"</?([A-Za-z][\w:.-]*)", re.IGNORECASE)
 
 
 def _tag_name(token: str) -> Optional[str]:
@@ -99,6 +102,20 @@ def sanitize_generated_markup(source: str, target: str) -> str:
         return token if _tag_name(token) in allowed else ""
 
     return _TAG_TOKEN_RE.sub(replace, target)
+
+
+def _serialize_inline_codes(node: ET.Element) -> str:
+    """Serialize a trusted protocol tree, retaining paired g and standalone x."""
+    def expand(match):
+        attributes = match.group(1)
+        # Unmapped-RA formatting markers are inert tokens replaced by exact spelling.
+        if ' id="fraus-format-' in attributes:
+            return match.group(0)
+        return f"<g{attributes}></g>"
+
+    # ET has escaped attribute values and character data, so literals cannot match.
+    return re.sub(r'<g((?:\s+[\w:.-]+="[^"]*")*)\s*/>', expand,
+                  ET.tostring(node, encoding="unicode"))
 
 
 def transform_file(input_path: str, output_path: str,
@@ -642,7 +659,7 @@ class FrausV2XmlTransform(XmlTransform):
                     marker.text = values[marker.get("id")]
             if correct_index == variant_index:
                 accepted_contexts[variant_index] = copy.deepcopy(target_root)
-            recovered = ET.tostring(target_root, encoding="unicode")
+            recovered = _serialize_inline_codes(target_root)
             recovered_lines[line_index] = self._preserve_line_ending(
                 source_line, recovered[len("<root>"):-len("</root>")])
         return "".join(recovered_lines)
@@ -794,7 +811,7 @@ class FrausV2XmlTransform(XmlTransform):
                     pieces.append(html.escape(plain[cursor:child_start], quote=False))
                     marker = copy.deepcopy(child)
                     marker.tail = None
-                    pieces.append(ET.tostring(marker, encoding="unicode"))
+                    pieces.append(_serialize_inline_codes(marker))
                     cursor = child_end
             pieces.append(html.escape(plain[cursor:end], quote=False))
             fragments.append("".join(pieces))
@@ -897,7 +914,7 @@ class FrausV2XmlTransform(XmlTransform):
                 trailing = source_value[len(source_value.rstrip()):]
                 setattr(node, attribute, leading + target_value + trailing)
 
-        recovered = ET.tostring(root, encoding="unicode")
+        recovered = _serialize_inline_codes(root)
         return recovered[len("<root>"):-len("</root>")] + line_ending
 
     @staticmethod
@@ -1617,7 +1634,7 @@ class Document(Translatable):
                                         trailing = value[len(value.rstrip()):]
                                         setattr(node, attribute, leading + target.strip() + trailing)
                             candidate = (escape(root.text or '', quote=False) + ''.join(
-                                ET.tostring(child, encoding='unicode') for child in root
+                                _serialize_inline_codes(child) for child in root
                             ))
                         self._fallback_diagnostics.append({
                             'type': 'line_alignment_recovery',
