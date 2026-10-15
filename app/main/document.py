@@ -397,6 +397,7 @@ class FrausV2XmlTransform(XmlTransform):
         runs = []
         previous = None
         text_index = option_index = 0
+        source_order = []
         for child in restored:
             if child.tag == "ExText":
                 if previous == "text":
@@ -416,6 +417,7 @@ class FrausV2XmlTransform(XmlTransform):
                 selects = child.findall("SelectOption")
                 select_index = selects.index(self._selected(selects, 0))
                 last_option_id = f"fraus-option-{record['source_id']}-{option_index}-{select_index}"
+                source_order.append(last_option_id)
                 option_index += 1
                 previous = "option"
         option_values = {}
@@ -475,6 +477,27 @@ class FrausV2XmlTransform(XmlTransform):
                 option_index += 1
             else:
                 new_children.append(copy.deepcopy(next(other_children)))
+        if payload is not None:
+            # Keep each complete InputOption (choices, correctness and IDs) with
+            # its following context runs. The translated correct variant owns
+            # their display order; distractor variants only supply choice text.
+            target_order = [node.get('id') for node in payload
+                            if node.tag == 'g' and node.get('id') in source_order]
+            if target_order != source_order:
+                if len(target_order) != len(source_order) or set(target_order) != set(source_order):
+                    raise FrausTranslationError('FRAUS option identity changed during reconstruction')
+                if any(child.tag not in ('ExText', 'InputOption') for child in new_children):
+                    raise FrausTranslationError('Cannot reorder FRAUS options across non-text children')
+                blocks = {}
+                prefix = []
+                current = prefix
+                option_index = 0
+                for child in new_children:
+                    if child.tag == 'InputOption':
+                        current = blocks[source_order[option_index]] = []
+                        option_index += 1
+                    current.append(child)
+                new_children = prefix + [child for key in target_order for child in blocks[key]]
         for position, child in enumerate(new_children):
             child.set("Position", str(position))
         restored[:] = new_children
@@ -514,6 +537,7 @@ class FrausV2XmlTransform(XmlTransform):
                 correct_indices[index] = offset
             offset += record["variants"]
         accepted_contexts = {}
+        accepted_source_markers = {}
         contextual_values = {}
         for line_index, index, source_line, target_line in zip(
                 source_variant_indices, variant_indices, source_variants, target_variants):
@@ -615,8 +639,11 @@ class FrausV2XmlTransform(XmlTransform):
                 })
                 if correct_index in accepted_contexts:
                     target_root = copy.deepcopy(accepted_contexts[correct_index])
-                    for marker, source_marker in zip(target_root.iter("g"), source_markers):
-                        marker.attrib = dict(source_marker.attrib)
+                    attributes = {previous.get('id'): dict(current.attrib)
+                                  for previous, current in zip(
+                                      accepted_source_markers[correct_index], source_markers)}
+                    for marker in target_root.iter("g"):
+                        marker.attrib = attributes[marker.get('id')]
                 else:
                     if owned_units is not None:
                         source_sentences = [source for source, _ in owned_units]
@@ -659,6 +686,7 @@ class FrausV2XmlTransform(XmlTransform):
                     marker.text = values[marker.get("id")]
             if correct_index == variant_index:
                 accepted_contexts[variant_index] = copy.deepcopy(target_root)
+                accepted_source_markers[variant_index] = source_markers
             recovered = _serialize_inline_codes(target_root)
             recovered_lines[line_index] = self._preserve_line_ending(
                 source_line, recovered[len("<root>"):-len("</root>")])
@@ -731,7 +759,27 @@ class FrausV2XmlTransform(XmlTransform):
 
     def _context_valid(self, source, target, option_ids):
         if self._shape(source) != self._shape(target):
-            return False
+            # Flat answer slots may move within their owning sentence. Other
+            # markup retains the strict shape check: moving formatting or text
+            # markers requires a different reconstruction contract.
+            source_ids = [child.get('id') for child in source]
+            target_ids = [child.get('id') for child in target]
+            if (source.tag != target.tag or source.get('id') != target.get('id')
+                    or len(source_ids) != len(set(source_ids))
+                    or len(target_ids) != len(source_ids)
+                    or set(target_ids) != set(source_ids)
+                    or any(child.tag != 'g' or child.get('id') not in option_ids or len(child)
+                           for root in (source, target) for child in root)):
+                return False
+            by_id = {child.get('id'): child for child in target}
+            # Each context run needs an existing source ExText to hold it.
+            if (bool((source.text or '').strip()) != bool((target.text or '').strip())
+                    or any(bool((child.tail or '').strip())
+                           != bool((by_id[child.get('id')].tail or '').strip())
+                           for child in source)):
+                return False
+            target = copy.deepcopy(target)
+            target[:] = [by_id[marker_id] for marker_id in source_ids]
         for source_node, target_node in zip(source.iter(), target.iter()):
             if source_node.get("id") not in option_ids:
                 if (source_node.text or "").strip() and not (target_node.text or "").strip():
