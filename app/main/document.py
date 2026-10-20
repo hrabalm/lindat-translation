@@ -32,6 +32,8 @@ from app.settings import (
 from app.text_utils import count_words
 from app.text_utils import split_text_into_sentences
 from document_translation.lindat_services.align import LindatAligner
+from document_translation.lindat_services.errors import AlignmentUnavailable
+from app.main.alignment import alignment_setting, create_aligner
 from document_translation.markuptranslator import Translator
 from app.main.markuptranslator import MarkupTranslator
 from document_translation.pdf_tools.pdfeditor import PdfEditor
@@ -1611,13 +1613,23 @@ class Document(Translatable):
             api.abort(code=413, message='The total text length in the document exceeds the translation limit.')
         self.debug_segments = []
         strict = isinstance(self.xml_transform, FrausV2XmlTransform)
+        alignment_policy = alignment_setting('ALIGNER_FAILURE_POLICY')
+        if alignment_policy not in ('recover', 'fail'):
+            raise ValueError('ALIGNER_FAILURE_POLICY must be recover or fail')
+        recover_alignment = strict and alignment_policy == 'recover'
+        alignment_failure = None
 
         def translate_markup(text):
+            nonlocal alignment_failure
             from app.models.llm_request_state import (
                 llm_state_checkpoint,
                 rollback_llm_state,
             )
 
+            if alignment_failure is not None:
+                # One exhausted outage budget per document, rather than waiting
+                # the full retry deadline again for every remaining sentence.
+                raise alignment_failure
             checkpoint = llm_state_checkpoint()
             translator = InnerLindatTranslator(
                 method, src, tgt, model, custom_prompt=custom_prompt,
@@ -1625,13 +1637,16 @@ class Document(Translatable):
                 strict=strict,
             )
             mt = MarkupTranslator(
-                translator, LindatAligner(src, tgt, show_progress=False), RegexTokenizer()
+                translator, create_aligner(src, tgt), RegexTokenizer()
             )
             try:
                 result = mt.translate(text)
                 result = sanitize_generated_markup(text, result)
             except Exception as error:
-                if not strict or isinstance(error, (AssertionError, ValueError)):
+                if recover_alignment and isinstance(error, AlignmentUnavailable):
+                    alignment_failure = error
+                    rollback_llm_state(checkpoint)
+                elif not strict or isinstance(error, (AssertionError, ValueError)):
                     rollback_llm_state(checkpoint)
                 raise
             self.debug_segments.extend(translator.debug_segments)
@@ -1662,7 +1677,9 @@ class Document(Translatable):
                 for unit_index, source_unit in enumerate(self.xml_transform._sentence_fragments(body)):
                     try:
                         candidate = translate_markup(source_unit)
-                    except (AssertionError, ValueError) as error:
+                    except (AssertionError, ValueError, AlignmentUnavailable) as error:
+                        if isinstance(error, AlignmentUnavailable) and not recover_alignment:
+                            raise
                         if isinstance(error, ValueError) and 'paired tag' not in str(error).lower():
                             raise
                         candidate = ''
@@ -1685,10 +1702,13 @@ class Document(Translatable):
                                 _serialize_inline_codes(child) for child in root
                             ))
                         self._fallback_diagnostics.append({
-                            'type': 'line_alignment_recovery',
+                            'type': ('alignment_service_recovery' if isinstance(error, AlignmentUnavailable)
+                                     else 'line_alignment_recovery'),
                             'line_index': index, 'unit_index': unit_index,
                             'strategy': 'transform_recovery' if not candidate else 'plain_text_nodes',
                             'reason': type(error).__name__,
+                            **({'upstream_status': error.upstream_status}
+                               if isinstance(error, AlignmentUnavailable) else {}),
                         })
                     else:
                         if unescape(re.sub(r'<[^>]*>', '', source_unit)).strip() and not unescape(
@@ -1701,7 +1721,11 @@ class Document(Translatable):
                     candidate = leading + ' '.join(candidate.strip().splitlines()) + trailing
                     units.append((source_unit, candidate))
                 self.xml_transform.translated_units[index] = units
-                lines.append(''.join(target for _, target in units) + ending)
+                translated_line = ''.join(target for _, target in units)
+                # An exhausted alignment may leave a whole unit empty. Keep an
+                # unterminated final line visible to splitlines() until transform
+                # recovery fills it; otherwise its source ownership disappears.
+                lines.append((translated_line or (' ' if not ending else '')) + ending)
             self.translation = ''.join(lines)
         else:
             self.translation = translate_with_line_fallback(

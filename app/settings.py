@@ -58,6 +58,18 @@ ALLOWED_EXTENSIONS = {'inxml', 'innopxml', 'txt', 'xml', 'html', 'htm', 'docx', 
 
 TIKAL_PATH = os.environ.get('TIKAL_PATH', '/home/jon/okapi-apps/')
 MODEL_SERVER = os.environ.get('MODEL_SERVER')
+ALIGNER_BASE_URL = os.environ.get('ALIGNER_BASE_URL', 'https://lindat.cz/services/text-aligner')
+ALIGNER_CONNECT_TIMEOUT = float(os.environ.get('ALIGNER_CONNECT_TIMEOUT', '10'))
+ALIGNER_READ_TIMEOUT = float(os.environ.get('ALIGNER_READ_TIMEOUT', '120'))
+ALIGNER_MAX_ATTEMPTS = int(os.environ.get('ALIGNER_MAX_ATTEMPTS', '5'))
+ALIGNER_RETRY_DEADLINE = float(os.environ.get('ALIGNER_RETRY_DEADLINE', '180'))
+ALIGNER_MAX_IN_FLIGHT = int(os.environ.get('ALIGNER_MAX_IN_FLIGHT', '4'))
+ALIGNER_QUEUE_TIMEOUT = float(os.environ.get('ALIGNER_QUEUE_TIMEOUT', '60'))
+# Stable across workers/restarts; unlike UPLOAD_FOLDER this must not be removed
+# on worker shutdown. All workers for an endpoint must use the same limit/path.
+ALIGNER_SLOT_DIR = os.environ.get('ALIGNER_SLOT_DIR', os.path.join(
+    tempfile.gettempdir(), f'lindat-alignment-{getattr(os, "getuid", os.getpid)()}'))
+ALIGNER_FAILURE_POLICY = os.environ.get('ALIGNER_FAILURE_POLICY', 'recover')
 FRAUS_V2_FORCE_SENTENCE_LEVEL = os.environ.get(
     'FRAUS_V2_FORCE_SENTENCE_LEVEL', 'true'
 ).lower() in {'1', 'true', 'yes'}

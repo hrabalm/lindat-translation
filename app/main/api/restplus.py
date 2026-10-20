@@ -2,6 +2,9 @@ from flask import current_app, make_response, render_template
 from flask_restx import Api
 
 from app.models.llm_errors import LLMBackendError
+from document_translation.lindat_services.errors import (
+    AlignmentError, AlignmentTimeout, AlignmentUnavailable,
+)
 
 # TODO terms, etc.
 api = Api(version='2.0', title='LINDAT Translation API', default_mediatype=None,
@@ -17,6 +20,19 @@ def handle_llm_backend_error(error):
         error,
     )
     return {"message": error.public_message}, error.status_code
+
+
+@api.errorhandler(AlignmentError)
+def handle_alignment_error(error):
+    if isinstance(error, AlignmentTimeout):
+        status, message = 504, 'The alignment backend timed out.'
+    elif isinstance(error, AlignmentUnavailable):
+        status, message = 503, 'The alignment backend is temporarily unavailable.'
+    else:
+        status, message = 502, 'The alignment backend could not provide valid alignments.'
+    current_app.logger.error('Alignment failure error=%s upstream_status=%s',
+                             type(error).__name__, error.upstream_status)
+    return {'message': message}, status
 
 
 @api.representation('text/plain')

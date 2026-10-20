@@ -700,8 +700,8 @@ wheels = [
 
 [[package]]
 name = "document-translation"
-version = "0.0.4"
-source = { git = "https://github.com/kukas/document-translation#e01b1ec10dfdaccdb583d7427547e89616ffc3e8" }
+version = "0.0.5"
+source = { git = "https://github.com/hrabalm/document-translation?rev=b10c2b37c2a0bfb419b13c92ce786a1a867a7005#b10c2b37c2a0bfb419b13c92ce786a1a867a7005" }
 dependencies = [
     { name = "pymupdf", version = "1.26.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "pymupdf", version = "1.28.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
@@ -1849,7 +1849,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "document-translation", git = "https://github.com/kukas/document-translation" },
+    { name = "document-translation", git = "https://github.com/hrabalm/document-translation?rev=b10c2b37c2a0bfb419b13c92ce786a1a867a7005" },
     { name = "eventlet" },
     { name = "flask" },
     { name = "flask-bootstrap" },

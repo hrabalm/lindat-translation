@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Flask frontend for translation services"
 requires-python = ">=3.9,<3.12"
 dependencies = [
-    "document-translation @ git+https://github.com/kukas/document-translation",
+    "document-translation @ git+https://github.com/hrabalm/document-translation@b10c2b37c2a0bfb419b13c92ce786a1a867a7005",
     "eventlet",
     "flask",
     "flask-bootstrap",
