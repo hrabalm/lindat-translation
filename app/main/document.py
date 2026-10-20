@@ -181,6 +181,9 @@ class FrausV2XmlTransform(XmlTransform):
         self.fallback_values = {}
         self.fallback_diagnostics = []
         self.translated_units = {}
+        # Enabled by FrausDocumentFormat only when real Okapi merges follow.
+        self.defer_unmapped_recovery = False
+        self.deferred_diagnostics = []
 
     def _split_text(self, text):
         if not self.force_sentence_level and not self.max_segment_tokens:
@@ -220,6 +223,7 @@ class FrausV2XmlTransform(XmlTransform):
         self.fallback_values = {}
         self.fallback_diagnostics = []
         self.translated_units = {}
+        self.deferred_diagnostics = []
 
         for ra in list(root.iter("RA")):
             if not any(ancestor.tag == "Questions" for ancestor in self._ancestors(root, ra)):
@@ -242,6 +246,7 @@ class FrausV2XmlTransform(XmlTransform):
                 "source_id": str(id(ra)),
                 "variants": max_options,
                 "path": self._element_path(root, ra),
+                "prepared_payloads": [],
             }
             self.variant_records[id(ra)] = record
             # ElementTree has no parent pointers; replace the RA in its owner.
@@ -257,6 +262,7 @@ class FrausV2XmlTransform(XmlTransform):
                 selected_keys, marker_kinds = self._flatten_context(
                     variant_ra, variant
                 )
+                record["prepared_payloads"].append(copy.deepcopy(variant_ra.find('ExText')))
                 self.variant_sequence.append(selected_keys)
                 self.variant_marker_kinds.append(marker_kinds)
                 owner.insert(insert_at + variant, variant_ra)
@@ -268,7 +274,9 @@ class FrausV2XmlTransform(XmlTransform):
         root = copy.deepcopy(translated_root)
         for source_id, record in self.variant_records.items():
             variants = [ra for ra in root.iter("RA")
-                        if ra.get(f"{{{self.namespace}}}source-ra") == str(source_id)]
+                         if ra.get(f"{{{self.namespace}}}source-ra") == str(source_id)]
+            if 'deferred_recovery' in record:
+                self._resolve_deferred_recovery(record, variants)
             if not variants:
                 continue
             correct = next((ra for ra in variants if ra.get(f"{{{self.namespace}}}variant") == "0"), variants[0])
@@ -282,6 +290,57 @@ class FrausV2XmlTransform(XmlTransform):
             owner.insert(index, restored)
 
         ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
+
+    def _resolve_deferred_recovery(self, record, variants):
+        """Use restored XML identities before deciding an unmapped RA needs repair.
+
+        This is deliberately stricter than the normal sentence-owned path: no
+        new reorderings are authorized without the extracted-unit ownership map.
+        """
+        translate_one, contextual_values, translations = record.pop('deferred_recovery')
+        numbers = [variant.get(f'{{{self.namespace}}}variant') for variant in variants]
+        expected_numbers = [str(index) for index in range(record['variants'])]
+        if sorted(numbers, key=str) != sorted(expected_numbers):
+            raise FrausTranslationError('FRAUS deferred variant identity changed during merge')
+        by_number = dict(zip(numbers, variants))
+
+        def visible(value):
+            return html.unescape(html.unescape(_TAG_TOKEN_RE.sub('', value or ''))).strip()
+
+        def formatting(value):
+            return [html.unescape(html.unescape(match.group()))
+                    for match in _TAG_TOKEN_RE.finditer(value or '')]
+
+        valid = True
+        for index, source in enumerate(record['prepared_payloads']):
+            payloads = by_number[str(index)].findall('ExText')
+            if len(payloads) != 1:
+                valid = False
+                break
+            target = payloads[0]
+            if source.get('Id') != target.get('Id') or self._shape(source) != self._shape(target):
+                valid = False
+                break
+            for before, after in zip(source.iter(), target.iter()):
+                for attribute in ('text', 'tail'):
+                    a, b = getattr(before, attribute), getattr(after, attribute)
+                    if ((visible(a) and not visible(b)) or formatting(a) != formatting(b)
+                            or any(marker in (b or '') for marker in self.context_placeholders
+                                   if marker not in (a or ''))):
+                        valid = False
+        if valid:
+            try:
+                # Also check reconstruction's context runs, complete choice
+                # coverage and non-option children before accepting merged data.
+                self._restore_ra(by_number['0'], variants, record)
+            except FrausTranslationError:
+                valid = False
+        self.deferred_diagnostics.append({
+            'source_id': record['source_id'], 'accepted': valid,
+            'strategy': 'merged_xml_identity',
+        })
+        if not valid:
+            self._recover_unmapped_ra(record, translate_one, contextual_values, translations)
 
     @staticmethod
     def _ancestors(root, target):
@@ -580,7 +639,10 @@ class FrausV2XmlTransform(XmlTransform):
             if not pending & record_indices:
                 continue
             pending.update(record_indices)
-            self._recover_unmapped_ra(record, translate_one, contextual_values, context_translations)
+            if self.defer_unmapped_recovery:
+                record['deferred_recovery'] = (translate_one, contextual_values, context_translations)
+            else:
+                self._recover_unmapped_ra(record, translate_one, contextual_values, context_translations)
         for line_index, variant_index, source_line, target_line in zip(
                 source_variant_indices, variant_indices, source_variants, target_variants):
             if variant_index in pending:
@@ -1224,6 +1286,8 @@ class FrausDocumentFormat(DocumentFormat):
             return
         preprocessed = context.input_path + ".preprocessed"
         self.xml_transform.preprocess(context.input_path, preprocessed)
+        if isinstance(self.xml_transform, FrausV2XmlTransform):
+            self.xml_transform.defer_unmapped_recovery = True
         context.input_path = preprocessed
         context.artifacts["preprocessed_xml"] = preprocessed
 
@@ -1557,6 +1621,7 @@ class Document(Translatable):
 
     def _run_document_pipeline(self, document_format, src, tgt, method, model, custom_prompt, terms, split):
         self.translated_path = self.get_translated_path(tgt)
+        self._reported_transform_diagnostics = 0
 
         def translate(text):
             self.text = text
@@ -1570,6 +1635,12 @@ class Document(Translatable):
         )
         self.translation = result.text
         self.debug_trace = dict(result.trace)
+        if isinstance(self.xml_transform, FrausV2XmlTransform):
+            self._fallback_diagnostics.extend(
+                self.xml_transform.fallback_diagnostics[self._reported_transform_diagnostics:])
+            if debug and self.xml_transform.deferred_diagnostics:
+                self.debug_trace['fraus_deferred_validation'] = copy.deepcopy(
+                    self.xml_transform.deferred_diagnostics)
         if self.debug_segments:
             self.debug_trace["llm_segments"] = self.debug_segments
         if debug and isinstance(self.xml_transform, FrausV2XmlTransform):
@@ -1745,6 +1816,7 @@ class Document(Translatable):
                 self._fallback_diagnostics.extend(
                     self.xml_transform.fallback_diagnostics
                 )
+                self._reported_transform_diagnostics = len(self.xml_transform.fallback_diagnostics)
         self._output_word_count = len(self.translation.split())
 
     def get_text(self):

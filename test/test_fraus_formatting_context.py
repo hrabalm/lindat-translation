@@ -188,7 +188,7 @@ class FrausFormattingContextTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get('RUN_FRAUS_OKAPI') == '1',
                          'Set RUN_FRAUS_OKAPI=1 and TIKAL_PATH for real Okapi')
-    def test_document_preserves_table_and_reports_recovery_with_real_okapi(self):
+    def test_document_preserves_table_using_merged_translation_with_real_okapi(self):
         tikal = Path(os.environ['TIKAL_PATH'])
         if tikal.is_file():
             tikal = tikal.parent
@@ -207,9 +207,10 @@ class FrausFormattingContextTests(unittest.TestCase):
                     'app.main.document.TIKAL_PATH', str(tikal) + os.sep), patch(
                     'app.main.document.text_input_with_src_tgt.parse_args',
                     return_value={'fraus': True, 'xmlTransform': 'fraus_v2'}), patch(
-                    'app.main.document.MarkupTranslator.translate', side_effect=lambda text: text), patch(
+                    'app.main.document.MarkupTranslator.translate',
+                    side_effect=lambda text: text.replace('>A<', '>Option target<')), patch(
                     'app.main.document.translate_from_to',
-                    side_effect=lambda src, tgt, text, **kwargs: ([text], ['Option target'])), patch(
+                    side_effect=AssertionError('Valid merged table should not need recovery')), patch(
                     'socket.socket.connect', side_effect=AssertionError('Network forbidden')), patch(
                     'socket.create_connection', side_effect=AssertionError('Network forbidden')), redirect_stderr(StringIO()):
                 document.translate_from_to('cs', 'en')
@@ -219,6 +220,5 @@ class FrausFormattingContextTests(unittest.TestCase):
                                  ['<table><tr><td>', '</td></tr></table>'])
                 self.assertEqual(tree.findtext('.//SelectOption/ExText'), 'Option target')
                 response = document.create_response({})
-                self.assertEqual(response.headers['X-FRAUS-Recovery'], 'recovered')
-                self.assertTrue(any(item['type'] == 'ambiguous_ra_recovery'
-                                    for item in response.get_json()['fraus_recovery']))
+                self.assertNotIn('X-FRAUS-Recovery', response.headers)
+                self.assertFalse(response.get_json().get('fraus_recovery'))
