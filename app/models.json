@@ -1,0 +1,371 @@
+[
+  {
+    "batch_size": 256,
+    "display": "EduKate",
+    "domain": "",
+    "few_shot_attempts": {
+      "cs-uk": [
+        [],
+        [
+          {
+            "source": "K",
+            "target": "K"
+          },
+          {
+            "source": "____",
+            "target": "____"
+          },
+          {
+            "source": "nadpis",
+            "target": "заголовок"
+          },
+          {
+            "source": "Vyber správnou odpověď.",
+            "target": "Обери правильну відповідь."
+          },
+          {
+            "source": "Doplň chybějící slovo.",
+            "target": "Доповни пропущене слово."
+          }
+        ],
+        [
+          {
+            "source": "K",
+            "target": "K"
+          },
+          {
+            "source": "____",
+            "target": "____"
+          },
+          {
+            "source": "nadpis",
+            "target": "заголовок"
+          },
+          {
+            "source": "Vyber správnou odpověď.",
+            "target": "Обери правильну відповідь."
+          },
+          {
+            "source": "Doplň chybějící slovo.",
+            "target": "Доповни пропущене слово."
+          },
+          {
+            "source": "Kolik stran má trojúhelník?",
+            "target": "Скільки сторін має трикутник?"
+          },
+          {
+            "source": "Přečti si text a odpověz na otázky.",
+            "target": "Прочитай текст і дай відповіді на запитання."
+          },
+          {
+            "source": "V textu najdi větu, která vysvětluje, proč se chlapec vrátil domů.",
+            "target": "Знайди в тексті речення, яке пояснює, чому хлопчик повернувся додому."
+          },
+          {
+            "source": "Porovnej oba obrázky. Napiš, co mají společného a v čem se liší.",
+            "target": "Порівняй обидва малюнки. Напиши, що в них спільного і чим вони відрізняються."
+          },
+          {
+            "source": "Nejprve doplň tabulku a potom vysvětli, jak jsi postupoval.",
+            "target": "Спочатку заповни таблицю, а потім поясни, як ти діяв."
+          }
+        ]
+      ]
+    },
+    "ignore_tags": false,
+    "max_completion_tokens": 512,
+    "model": "edukate_csuk_v1",
+    "model_framework": "oai_llm",
+    "prompt": "### Instruction\nTranslate Input from {src} to {tgt}\n### Input\n{sentence}\n### Response\n",
+    "provider": "ufal",
+    "server": "http://localhost:8000",
+    "source": [
+      "cs"
+    ],
+    "target": [
+      "uk"
+    ],
+    "temperature": 0.0,
+    "token": "token-abc123",
+    "weight": 0.1,
+    "adaptive_completion_budget": {
+      "min_tokens": 64,
+      "tokens_per_input_token": 4,
+      "extra_tokens": 32
+    }
+  },
+  {
+    "batch_size": 256,
+    "display": "EduKate",
+    "domain": "",
+    "ignore_tags": false,
+    "max_completion_tokens": 512,
+    "model": "edukate_csen_v1",
+    "model_framework": "oai_llm",
+    "prompt": "### Instruction\nTranslate Input from {src} to {tgt}\n### Input\n{sentence}\n### Response\n",
+    "provider": "ufal",
+    "server": "http://localhost:8000",
+    "source": [
+      "cs"
+    ],
+    "target": [
+      "en"
+    ],
+    "temperature": 0.0,
+    "token": "token-abc123",
+    "weight": 0.1,
+    "adaptive_completion_budget": {
+      "min_tokens": 64,
+      "tokens_per_input_token": 4,
+      "extra_tokens": 32
+    }
+  },
+  {
+    "batch_size": 256,
+    "display": "EduKate",
+    "domain": "",
+    "few_shot_attempts": {
+      "cs-de": [
+        [],
+        [
+          {
+            "source": "K",
+            "target": "K"
+          },
+          {
+            "source": "____",
+            "target": "____"
+          },
+          {
+            "source": "nadpis",
+            "target": "Überschrift"
+          },
+          {
+            "source": "Vyber správnou odpověď.",
+            "target": "Wähle die richtige Antwort."
+          },
+          {
+            "source": "Doplň chybějící slovo.",
+            "target": "Ergänze das fehlende Wort."
+          }
+        ],
+        [
+          {
+            "source": "K",
+            "target": "K"
+          },
+          {
+            "source": "____",
+            "target": "____"
+          },
+          {
+            "source": "nadpis",
+            "target": "Überschrift"
+          },
+          {
+            "source": "Vyber správnou odpověď.",
+            "target": "Wähle die richtige Antwort."
+          },
+          {
+            "source": "Doplň chybějící slovo.",
+            "target": "Ergänze das fehlende Wort."
+          },
+          {
+            "source": "Kolik stran má trojúhelník?",
+            "target": "Wie viele Seiten hat ein Dreieck?"
+          },
+          {
+            "source": "Přečti si text a odpověz na otázky.",
+            "target": "Lies den Text und beantworte die Fragen."
+          },
+          {
+            "source": "V textu najdi větu, která vysvětluje, proč se chlapec vrátil domů.",
+            "target": "Finde im Text den Satz, der erklärt, warum der Junge nach Hause zurückgekehrt ist."
+          },
+          {
+            "source": "Porovnej oba obrázky. Napiš, co mají společného a v čem se liší.",
+            "target": "Vergleiche die beiden Bilder. Schreibe auf, was sie gemeinsam haben und worin sie sich unterscheiden."
+          },
+          {
+            "source": "Nejprve doplň tabulku a potom vysvětli, jak jsi postupoval.",
+            "target": "Vervollständige zuerst die Tabelle und erkläre dann, wie du vorgegangen bist."
+          }
+        ]
+      ]
+    },
+    "ignore_tags": false,
+    "max_completion_tokens": 512,
+    "model": "edukate_csde_v1",
+    "model_framework": "oai_llm",
+    "prompt": "### Instruction\nTranslate Input from {src} to {tgt}\n### Input\n{sentence}\n### Response\n",
+    "provider": "ufal",
+    "server": "http://localhost:8000",
+    "source": [
+      "cs"
+    ],
+    "target": [
+      "de"
+    ],
+    "temperature": 0.0,
+    "token": "token-abc123",
+    "weight": 0.1,
+    "adaptive_completion_budget": {
+      "min_tokens": 64,
+      "tokens_per_input_token": 4,
+      "extra_tokens": 32
+    }
+  },
+  {
+    "batch_size": 256,
+    "display": "LLM test",
+    "domain": "",
+    "ignore_tags": false,
+    "model": "aya-expanse-8b",
+    "model_framework": "oai_llm",
+    "provider": "CohereLabs",
+    "server": "http://localhost:8000",
+    "source": [
+      "ar",
+      "zh",
+      "cs",
+      "nl",
+      "en",
+      "fr",
+      "de",
+      "el",
+      "he",
+      "hi",
+      "id",
+      "it",
+      "ja",
+      "ko",
+      "fa",
+      "pl",
+      "pt",
+      "ro",
+      "ru",
+      "es",
+      "tr",
+      "uk",
+      "vi"
+    ],
+    "target": [
+      "ar",
+      "zh",
+      "cs",
+      "nl",
+      "en",
+      "fr",
+      "de",
+      "el",
+      "he",
+      "hi",
+      "id",
+      "it",
+      "ja",
+      "ko",
+      "fa",
+      "pl",
+      "pt",
+      "ro",
+      "ru",
+      "es",
+      "tr",
+      "uk",
+      "vi"
+    ],
+    "token": "token-abc123",
+    "weight": 0.1
+  },
+  {
+    "batch_size": 256,
+    "display": "LLM test",
+    "domain": "",
+    "ignore_tags": false,
+    "max_completion_tokens": 512,
+    "model": "EuroLLM-9B-Instruct",
+    "model_framework": "oai_llm",
+    "prompt": "Translate the following {src} source text to {tgt}:\n{src}: {sentence}\n{tgt}: ",
+    "provider": "utter-project",
+    "server": "http://localhost:8000",
+    "source": [
+      "bg",
+      "hr",
+      "cs",
+      "da",
+      "nl",
+      "en",
+      "et",
+      "fi",
+      "fr",
+      "de",
+      "el",
+      "hu",
+      "ga",
+      "it",
+      "lv",
+      "lt",
+      "mt",
+      "pl",
+      "pt",
+      "ro",
+      "sk",
+      "sl",
+      "es",
+      "sv",
+      "ar",
+      "ca",
+      "zh",
+      "gl",
+      "hi",
+      "ja",
+      "ko",
+      "no",
+      "ru",
+      "tr",
+      "uk",
+      "vi"
+    ],
+    "target": [
+      "bg",
+      "hr",
+      "cs",
+      "da",
+      "nl",
+      "en",
+      "et",
+      "fi",
+      "fr",
+      "de",
+      "el",
+      "hu",
+      "ga",
+      "it",
+      "lv",
+      "lt",
+      "mt",
+      "pl",
+      "pt",
+      "ro",
+      "sk",
+      "sl",
+      "es",
+      "sv",
+      "ar",
+      "ca",
+      "zh",
+      "gl",
+      "hi",
+      "ja",
+      "ko",
+      "no",
+      "ru",
+      "tr",
+      "uk",
+      "vi"
+    ],
+    "temperature": 0.05,
+    "token": "token-abc123",
+    "weight": 0.1
+  }
+]

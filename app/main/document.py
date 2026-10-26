@@ -40,6 +40,10 @@ from document_translation.pdf_tools.pdfeditor import PdfEditor
 from document_translation.regextokenizer import RegexTokenizer
 
 
+# Emergency switch for downstream consumers that require the original RA shape.
+FRAUS_CREATE_CONTEXT_SLOTS = True
+
+
 def fix_fraus_encoding(line: str) -> str:
     if line.startswith('<?xml version="1.0" encoding="utf-16"?>'):
         return line.replace("utf-16", "utf-8")
@@ -184,6 +188,7 @@ class FrausV2XmlTransform(XmlTransform):
         # Enabled by FrausDocumentFormat only when real Okapi merges follow.
         self.defer_unmapped_recovery = False
         self.deferred_diagnostics = []
+        self.generated_context_ids = []
 
     def _split_text(self, text):
         if not self.force_sentence_level and not self.max_segment_tokens:
@@ -224,6 +229,7 @@ class FrausV2XmlTransform(XmlTransform):
         self.fallback_diagnostics = []
         self.translated_units = {}
         self.deferred_diagnostics = []
+        self.generated_context_ids = []
 
         for ra in list(root.iter("RA")):
             if not any(ancestor.tag == "Questions" for ancestor in self._ancestors(root, ra)):
@@ -288,6 +294,9 @@ class FrausV2XmlTransform(XmlTransform):
             for variant in variants:
                 owner.remove(variant)
             owner.insert(index, restored)
+            generated = set(record.get('generated_context_slots', {}).values())
+            self.generated_context_ids.extend(
+                child.get('Id') for child in restored if child.get('Id') in generated)
 
         ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
 
@@ -509,20 +518,39 @@ class FrausV2XmlTransform(XmlTransform):
             raise FrausTranslationError("FRAUS non-option children changed during reconstruction")
         other_children = iter(translated_other)
         new_children = []
+        def add_context_slot(key, value, neighbor):
+            if not FRAUS_CREATE_CONTEXT_SLOTS or not value:
+                return
+            if not html.unescape(html.unescape(_TAG_TOKEN_RE.sub('', value))).strip():
+                return
+            ids = record.setdefault('generated_context_slots', {})
+            if key not in ids:
+                ids[key] = str(uuid.uuid4())
+            attrs = {'Id': ids[key], 'Part': '0'}
+            parent_id = neighbor.get('ParentId') or restored.get('Id')
+            if parent_id:
+                attrs['ParentId'] = parent_id
+            node = ET.Element('ExText', attrs)
+            node.text = value
+            new_children.append(node)
+
+        original_children = list(restored)
+        if payload is not None and original_children and original_children[0].tag == 'InputOption':
+            add_context_slot('prefix', payload.text, original_children[0])
         run_index = 0
         option_index = 0
-        for child in list(restored):
+        for child_index, child in enumerate(original_children):
             if child.tag == "ExText":
                 value = runs[run_index] if run_index < len(runs) else None
                 source_visible = html.unescape(html.unescape(_TAG_TOKEN_RE.sub(
                     "", child.text or ""))).strip()
                 target_visible = html.unescape(html.unescape(_TAG_TOKEN_RE.sub(
                     "", value or ""))).strip()
-                if source_visible and not target_visible:
+                if source_visible and not target_visible and not record.get('sentence_context_movement'):
                     raise FrausTranslationError("FRAUS context reconstruction has no usable translation")
                 # Layout-only runs belong to the source, not the translation.
                 if source_visible:
-                    child.text = value
+                    child.text = value or ''
                 new_children.append(child)
                 run_index += 1
             elif child.tag == "InputOption":
@@ -535,6 +563,14 @@ class FrausV2XmlTransform(XmlTransform):
                     elif option_text is not None and (option_text.text or "").strip():
                         raise FrausTranslationError("FRAUS option reconstruction has no usable translation")
                 new_children.append(child)
+                # A marker's tail belongs immediately after this complete slot.
+                # Existing ExText nodes are handled by the ordinary path above.
+                if (payload is not None and (child_index + 1 == len(original_children)
+                        or original_children[child_index + 1].tag == 'InputOption')):
+                    marker_id = source_order[option_index]
+                    marker = payload.find(f'./g[@id="{marker_id}"]')
+                    if marker is not None:
+                        add_context_slot(marker_id, marker.tail, child)
                 option_index += 1
             else:
                 new_children.append(copy.deepcopy(next(other_children)))
@@ -592,10 +628,12 @@ class FrausV2XmlTransform(XmlTransform):
         recovered_lines = list(target_lines)
 
         correct_indices = {}
+        variant_records = {}
         offset = 0
         for record in self.variant_records.values():
             for index in range(offset, offset + record["variants"]):
                 correct_indices[index] = offset
+                variant_records[index] = record
             offset += record["variants"]
         accepted_contexts = {}
         accepted_source_markers = {}
@@ -666,13 +704,15 @@ class FrausV2XmlTransform(XmlTransform):
             except ET.ParseError:
                 target_root = ET.Element("root")
             option_ids = {marker.get("id") for marker in option_markers}
-            context_valid = self._context_valid(source_root, target_root, option_ids)
             owned_units = self.translated_units.get(line_index)
+            context_valid = self._context_valid(
+                source_root, target_root, option_ids, allow_context_movement=bool(owned_units))
             if owned_units is not None:
                 for source_unit, target_unit in owned_units:
                     try:
                         unit_valid = self._context_valid(
-                            self._parse_fragment(source_unit), self._parse_fragment(target_unit), option_ids)
+                            self._parse_fragment(source_unit), self._parse_fragment(target_unit), option_ids,
+                            allow_context_movement=True)
                     except ET.ParseError:
                         unit_valid = False
                     context_valid = context_valid and unit_valid
@@ -695,6 +735,12 @@ class FrausV2XmlTransform(XmlTransform):
                 self.fallback_values.setdefault(select_id, value or "")
 
             correct_index = correct_indices.get(variant_index, variant_index)
+            if (context_valid and owned_units and correct_index == variant_index
+                    and variant_index in variant_records
+                    and not self._context_valid(source_root, target_root, option_ids)):
+                # Every owned sentence passed independently. Permit empty source
+                # context slots when its words moved to another existing slot.
+                variant_records[variant_index]['sentence_context_movement'] = True
             if not context_valid:
                 self.fallback_diagnostics.append({
                     "type": "unsafe_context_variant", "variant_index": variant_index,
@@ -736,7 +782,7 @@ class FrausV2XmlTransform(XmlTransform):
                         try:
                             valid = self._context_valid(
                                 self._parse_fragment(sentence), self._parse_fragment(candidate),
-                                option_ids)
+                                option_ids, allow_context_movement=False)
                         except ET.ParseError:
                             valid = False
                         recovered_parts.append(candidate if valid else self._recover_context(
@@ -821,7 +867,25 @@ class FrausV2XmlTransform(XmlTransform):
     def _shape(node):
         return (node.tag, node.get("id"), tuple(FrausV2XmlTransform._shape(child) for child in node))
 
-    def _context_valid(self, source, target, option_ids):
+    def _context_valid(self, source, target, option_ids, allow_context_movement=False):
+        if (allow_context_movement and len(source)
+                and self._shape(source) == self._shape(target)
+                and len({child.get('id') for child in source}) == len(source)
+                and all(child.tag == 'g' and child.get('id') in option_ids and not len(child)
+                        for root in (source, target) for child in root)):
+            # Sentence provenance is required at the call site. For flat,
+            # unchanged answer slots, prose may move between existing context
+            # runs. New runs require slot creation to be enabled; vanished
+            # sentence context and moved embedded formatting remain invalid.
+            before = [source.text or ''] + [child.tail or '' for child in source]
+            after = [target.text or ''] + [child.tail or '' for child in target]
+            if (not any(_TAG_TOKEN_RE.search(value) for value in before + after)
+                    and any(value.strip() for value in after)
+                    and (not any(char.isalnum() for value in before for char in value)
+                         or any(char.isalnum() for value in after for char in value))
+                    and (FRAUS_CREATE_CONTEXT_SLOTS
+                         or all(a.strip() or not b.strip() for a, b in zip(before, after)))):
+                return True
         if self._shape(source) != self._shape(target):
             # Flat answer slots may move within their owning sentence. Other
             # markup retains the strict shape check: moving formatting or text
@@ -1638,6 +1702,16 @@ class Document(Translatable):
         if isinstance(self.xml_transform, FrausV2XmlTransform):
             self._fallback_diagnostics.extend(
                 self.xml_transform.fallback_diagnostics[self._reported_transform_diagnostics:])
+            if debug:
+                if self.xml_transform.generated_context_ids:
+                    self.debug_trace['fraus_generated_context_ids'] = list(
+                        self.xml_transform.generated_context_ids)
+                moved = [child.get('Id')
+                         for record in self.xml_transform.variant_records.values()
+                         if record.get('sentence_context_movement')
+                         for child in record['original'].findall('ExText') if child.get('Id')]
+                if moved:
+                    self.debug_trace['fraus_movable_context_ids'] = moved
             if debug and self.xml_transform.deferred_diagnostics:
                 self.debug_trace['fraus_deferred_validation'] = copy.deepcopy(
                     self.xml_transform.deferred_diagnostics)
