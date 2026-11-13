@@ -4,7 +4,7 @@ from flask import g
 
 dirname = os.path.dirname(__file__)
 
-DATABASE = os.path.join(dirname, 'database.db')
+DATABASE = os.environ.get('LINDAT_DATABASE_PATH', os.path.join(dirname, 'database.db'))
 
 
 def get_db():

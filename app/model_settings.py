@@ -145,7 +145,7 @@ class Languages(object):
                 from_lang.targets.add(lang)
 
 
-with open(os.path.join(os.path.dirname(__file__), 'models.json')) as models_json:
+with open(os.environ.get('LINDAT_MODELS_PATH', os.path.join(os.path.dirname(__file__), 'models.json'))) as models_json:
     models_cfg = json.load(models_json)
 
 models = Models(models_cfg)
